@@ -38,7 +38,7 @@ from . import (db, registry, pipeline, llm, toolregistry, mcp, runtime, models, 
 
 
 
-               skills as skilllib, ptpl, widgetlib)
+               skills as skilllib, ptpl, widgetlib, kblib, memlib, wflib)
 
 
 
@@ -115,6 +115,9 @@ async def _startup():
     db.init_db()
     ptpl.ensure_tables()
     widgetlib.ensure_tables()
+    kblib.ensure_tables()
+    memlib.ensure_tables()
+    wflib.ensure_tables()
 
 
 
@@ -2179,6 +2182,35 @@ async def chat_endpoint(body: ChatMessageIn, request: Request):
     # Widget 协议注入：让智能体可以在回复中输出交互卡片
     system = (system or "") + "\n\n" + widgetlib.WIDGET_PROMPT
 
+    # 知识库 RAG：智能体绑定的知识库 → 检索注入参考材料
+    _kb_ids = (agent_spec or {}).get("knowledge_bases") or []
+    _kb_hits = []
+    if _kb_ids:
+        try:
+            _kb_hits = kblib.search(_kb_ids, body.message, 5)
+            if _kb_hits:
+                system += "\n\n" + kblib.format_context(_kb_hits)
+        except Exception:
+            pass
+    # 长期记忆：召回注入
+    _op_id, _op_nm = _operator(request)
+    _mem_ctx = memlib.format_context(memlib.get_memory(_op_id, body.agent_id or ""))
+    if _mem_ctx:
+        system += "\n\n" + _mem_ctx
+
+    # 记忆异步沉淀（守护线程，失败不影响对话）
+    def _memory_update(assistant_text):
+        try:
+            import threading
+            threading.Thread(
+                target=memlib.summarize_update,
+                args=(_op_id, body.agent_id or "", body.message, assistant_text,
+                      lambda s, u: llm.chat(s, u, hint="memory")),
+                daemon=True).start()
+        except Exception:
+            pass
+
+
 
 
     
@@ -2220,6 +2252,7 @@ async def chat_endpoint(body: ChatMessageIn, request: Request):
                                     final["tokens_in"], final["tokens_out"], final["latency_ms"])
                 yield _sse({"t": "done", "model": final["model"], "mocked": False,
                             "tokens_in": final["tokens_in"], "tokens_out": final["tokens_out"]})
+                _memory_update(final["content"])
             except Exception as e:
                 err_msg = str(e)[:500]
                 db.add_chat_message(cid, "assistant", "".join(parts), error=err_msg)
@@ -2285,6 +2318,7 @@ async def chat_endpoint(body: ChatMessageIn, request: Request):
 
 
 
+        _memory_update(r.content)
         return {
 
 
@@ -3223,3 +3257,187 @@ def widget_duplicate(wid: int, request: Request):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "item": item}
+
+
+# ================================================================== 知识库（RAG）
+class KBIn(BaseModel):
+    name: str
+    description: str = ""
+
+
+@app.get("/api/kbs")
+def kb_list():
+    return {"items": kblib.list_kbs()}
+
+
+@app.post("/api/kbs")
+def kb_create(body: KBIn):
+    if not body.name.strip():
+        raise HTTPException(400, "名称不能为空")
+    try:
+        kid = kblib.create_kb(body.name, body.description)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "id": kid}
+
+
+@app.put("/api/kbs/{kid}")
+def kb_update(kid: int, body: KBIn):
+    if not kblib.get_kb(kid):
+        raise HTTPException(404, "知识库不存在")
+    kblib.update_kb(kid, body.name, body.description)
+    return {"ok": True}
+
+
+@app.delete("/api/kbs/{kid}")
+def kb_delete(kid: int):
+    kblib.delete_kb(kid)
+    return {"ok": True}
+
+
+@app.get("/api/kbs/{kid}/docs")
+def kb_docs(kid: int):
+    if not kblib.get_kb(kid):
+        raise HTTPException(404, "知识库不存在")
+    return {"items": kblib.list_docs(kid)}
+
+
+@app.post("/api/kbs/{kid}/docs")
+async def kb_upload(kid: int, request: Request):
+    if not kblib.get_kb(kid):
+        raise HTTPException(404, "知识库不存在")
+    form = await request.form()
+    up = form.get("file")
+    if up is None or not hasattr(up, "read"):
+        raise HTTPException(400, "缺少文件字段 file")
+    data = await up.read()
+    try:
+        did, n = kblib.add_doc(kid, up.filename or "未命名.txt", data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "id": did, "chunks": n}
+
+
+@app.delete("/api/kbs/{kid}/docs/{did}")
+def kb_doc_delete(kid: int, did: int):
+    kblib.delete_doc(kid, did)
+    return {"ok": True}
+
+
+class KBSearchIn(BaseModel):
+    kb_ids: List[int] = []
+    q: str
+    top_k: int = 5
+
+
+@app.post("/api/kbs/search")
+def kb_search_api(body: KBSearchIn):
+    """召回测试：输入问题，返回各知识库命中片段（含得分与来源）。"""
+    if not body.q.strip():
+        raise HTTPException(400, "查询不能为空")
+    hits = kblib.search(body.kb_ids, body.q, body.top_k)
+    return {"items": hits}
+
+
+# ================================================================== 长期记忆
+@app.get("/api/memory")
+def memory_get(request: Request, agent_id: str = ""):
+    oid, _onm = _operator(request)
+    return {"content": memlib.get_memory(oid, agent_id)}
+
+
+@app.put("/api/memory")
+def memory_set(request: Request, body: dict = None):
+    body = body or {}
+    agent_id = body.get("agent_id") or ""
+    content = body.get("content") or ""
+    oid, _onm = _operator(request)
+    memlib.set_memory(oid, agent_id, content)
+    return {"ok": True}
+
+
+# ================================================================== 工作流
+class WFIn(BaseModel):
+    name: str
+    description: str = ""
+    spec_json: str = "{}"
+
+
+@app.get("/api/wf")
+def wf_list():
+    return {"items": wflib.list_workflows()}
+
+
+@app.post("/api/wf")
+def wf_create(body: WFIn, request: Request):
+    if not body.name.strip():
+        raise HTTPException(400, "名称不能为空")
+    _oid, onm = _operator(request)
+    try:
+        wid = wflib.create_workflow(body.name, body.description, body.spec_json, creator=onm)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "id": wid}
+
+
+@app.get("/api/wf/{wid}")
+def wf_get(wid: int):
+    w = wflib.get_workflow(wid)
+    if not w:
+        raise HTTPException(404, "工作流不存在")
+    return w
+
+
+@app.put("/api/wf/{wid}")
+def wf_update(wid: int, body: WFIn):
+    try:
+        w = wflib.update_workflow(wid, body.name, body.description, body.spec_json)
+    except ValueError as e:
+        code = 400 if ("JSON" in str(e) or "节点" in str(e) or "连线" in str(e)) else 404
+        raise HTTPException(code, str(e))
+    if not w:
+        raise HTTPException(404, "工作流不存在")
+    return {"ok": True, "item": w}
+
+
+@app.delete("/api/wf/{wid}")
+def wf_delete(wid: int):
+    try:
+        wflib.delete_workflow(wid)
+    except ValueError as e:
+        raise HTTPException(403, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/wf/{wid}/duplicate")
+def wf_duplicate(wid: int, request: Request):
+    _oid, onm = _operator(request)
+    try:
+        wid2 = wflib.duplicate(wid, creator=onm)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"ok": True, "id": wid2}
+
+
+class WFRunIn(BaseModel):
+    inputs: dict = {}
+
+
+@app.post("/api/wf/{wid}/run")
+async def wf_run(wid: int, body: WFRunIn):
+    def _llm(system, user):
+        return llm.chat(system, user, hint="workflow")
+    def _kb(ids, q, k):
+        return kblib.format_context(kblib.search(ids, q, k))
+    try:
+        r = await asyncio.to_thread(wflib.run_workflow, wid, body.inputs, _llm, _kb)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error") or "执行失败")
+    return r
+
+
+@app.get("/api/wf/{wid}/runs")
+def wf_runs(wid: int):
+    return {"items": wflib.list_runs(wid)}

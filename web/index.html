@@ -4713,6 +4713,32 @@ header .logo,header .tab,header .view-switch button,header .badge,header button{
 .wt-preview:after{content:'';position:absolute;left:0;right:0;bottom:0;height:36px;background:linear-gradient(transparent,var(--panel))}
 .wt-preview .wg-card{background:var(--panel2)}
 
+
+/* ---- 知识库 / 工作流 / 记忆 ---- */
+.wf-canvas{position:relative;height:460px;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  background-image:radial-gradient(var(--line) 1px, transparent 1px);background-size:22px 22px}
+.wf-svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+.wf-edge{stroke:var(--blue);stroke-width:2;fill:none;pointer-events:stroke;cursor:pointer}
+.wf-edge:hover{stroke:var(--red)}
+.wf-node{position:absolute;width:170px;background:var(--panel);border:1px solid var(--line);border-radius:9px;
+  padding:8px 10px;cursor:grab;user-select:none;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.wf-node.head-selected{border-color:var(--blue)}
+.wf-node.link-target{border-color:var(--green);box-shadow:0 0 0 3px rgba(34,197,94,.25)}
+.wf-node-head{font-size:12.5px;font-weight:600}
+.wf-node-type{font-size:10.5px;color:var(--dim);margin-top:2px}
+.wf-node.t-start{border-color:var(--green)}
+.wf-node.t-llm{border-color:var(--blue)}
+.wf-node.t-reply,.wf-node.t-end{border-color:var(--amber)}
+.wf-node.t-kb_search{border-color:#a78bfa}
+.wf-node.t-widget{border-color:#f472b6}
+.wf-node.t-condition{border-color:#fbbf24}
+.wf-port{position:absolute;width:12px;height:12px;border-radius:50%;background:var(--panel2);border:2px solid var(--line);top:50%;margin-top:-6px;cursor:crosshair}
+.wf-port.in{left:-7px}
+.wf-port.out{right:-7px;border-color:var(--blue)}
+.wf-mini{width:44%;padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:12px}
+.chk{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--line);border-radius:8px;padding:8px 10px;cursor:pointer}
+.chk.on{border-color:var(--green);background:rgba(34,197,94,.06)}
+
 </style>
 
 
@@ -5392,6 +5418,8 @@ const TABS = [
   {id:'prompt', name:'提示词资产',   roles:['builder']},
   {id:'ptpl',  name:'提示词模板',   roles:['builder']},
   {id:'widget', name:'Widget',      roles:['builder']},
+  {id:'kb',    name:'知识库',       roles:['builder']},
+  {id:'wf',    name:'工作流',       roles:['builder']},
 
 
 
@@ -7034,6 +7062,8 @@ async function render(){
     if(S.tab === 'prompt') await viewPrompts(v, seq);
     if(S.tab === 'ptpl')  await viewPTpl(v, seq);
     if(S.tab === 'widget') await viewWidget(v, seq);
+    if(S.tab === 'kb')    await viewKB(v, seq);
+    if(S.tab === 'wf')    await viewWF(v, seq);
 
 
 
@@ -9337,7 +9367,7 @@ function openChatModal(agent){
 
 
 
-        '<div class="chat-input-area">' +
+        '<div class="row" style="padding:0 2px 6px"><span class="small" style="cursor:pointer;color:var(--blue)" onclick="openMemory()">🧠 记忆</span></div>'+'<div class="chat-input-area">' +
 
 
 
@@ -13317,7 +13347,7 @@ function newAgent(){
 
 
 
-               runtime:'chat', output:'markdown', skills:[], tools:[], input_schema:[],
+               runtime:'chat', output:'markdown', skills:[], tools:[], input_schema:[], knowledge_bases:[],
 
 
 
@@ -13381,7 +13411,7 @@ function newAgent(){
 
 
 
-  renderEditor(null);
+  kbEnsure().then(() => renderEditor(null));
 
 
 
@@ -13797,7 +13827,8 @@ async function renderEditor(aid){
 
 
 
-      temperature:d.temperature || 0.4, model:d.model || ''};
+      temperature:d.temperature || 0.4, model:d.model || '', knowledge_bases:d.knowledge_bases || []};
+    await kbEnsure();
 
 
 
@@ -14469,7 +14500,7 @@ async function renderEditor(aid){
 
 
 
-    '<div class="field"><label>执行方式</label><div class="small" style="margin:-2px 0 8px">决定这个智能体用哪条执行链路干活。链路本身由平台代码实现，这里只做选择；运行参数在右上角「设置 → 执行引擎」里调整。</div><div class="grid g2">' +
+    kbBindHTML(E) + '<div class="field"><label>执行方式</label><div class="small" style="margin:-2px 0 8px">决定这个智能体用哪条执行链路干活。链路本身由平台代码实现，这里只做选择；运行参数在右上角「设置 → 执行引擎」里调整。</div><div class="grid g2">' +
 
 
 
@@ -17276,7 +17307,8 @@ function collect(){
 
 
 
-    input_schema:E.input_schema, skills:E.skills, tools:E.tools, runtime:E.runtime, icon:E.icon});
+    input_schema:E.input_schema, skills:E.skills, tools:E.tools, runtime:E.runtime, icon:E.icon,
+    knowledge_bases:(E.knowledge_bases || [])});
 
 
 
@@ -33291,6 +33323,505 @@ async function wtSave(id){
     else{ await api('/api/widgets', {method:'POST', body:JSON.stringify(body)}); WT.tab = 'custom'; }
     closeModal(); wtToast('已保存'); wtGo();
   }catch(e){ msg('wtMsg', 'err', e.message); }
+}
+
+
+/* ------------------------------------------------------------ 知识库（RAG） */
+const KB = {list:[], cur:null, docs:[], q:'', topk:5, hits:[], testing:false};
+
+async function viewKB(v, seq){
+  await kbLoad();
+  setView(v, seq, renderKB());
+}
+async function kbLoad(){
+  try{ const d = await api('/api/kbs'); KB.list = d.items || []; }catch(e){ KB.list = []; }
+}
+function kbRepaint(){ const v = $('view'); if(v && S.tab === 'kb') v.innerHTML = renderKB(); }
+function kbGo(){ viewKB($('view'), renderSeq); }
+function kbToast(t){ wtToast(t); }
+
+function kbSize(n){ n = n || 0; return n > 1048576 ? (n/1048576).toFixed(1)+'MB' : (n/1024).toFixed(0)+'KB'; }
+
+function renderKB(){
+  if(KB.cur){
+    return renderKBDetail();
+  }
+  let h = '<div class="card"><div class="row" style="align-items:center;flex-wrap:wrap">' +
+    '<b style="font-size:15px">知识库</b>' +
+    '<span class="small" style="margin-left:10px">上传文档 → 自动切分索引 → 对话时自动检索注入（RAG），支持 md/txt/docx/pdf/html</span>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    '<button class="ghost sm" onclick="kbNew()">+ 新建知识库</button>' +
+    '<button class="ghost sm" onclick="kbTestAll()">召回测试</button>' +
+    '</div></div>';
+  if(!KB.list.length){
+    h += '<div class="empty">还没有知识库<br></div>';
+  }else{
+    h += '<div class="wt-grid">';
+    KB.list.forEach(k => {
+      h += '<div class="wt-card">' +
+        '<div class="row" style="align-items:center"><b style="font-size:13.5px">📚 ' + esc(k.name) + '</b>' +
+        '<span class="spacer" style="flex:1"></span></div>' +
+        '<div class="small" style="color:var(--dim);margin:6px 0;min-height:32px">' + esc(k.description || '') + '</div>' +
+        '<div class="small" style="color:var(--dim)">' + (k.doc_count||0) + ' 篇文档 · ' + (k.chunk_count||0) + ' 个切片</div>' +
+        '<div class="row" style="margin-top:10px;gap:10px">' +
+        '<a class="ptpl-act" onclick="kbOpen(' + k.id + ')">管理</a>' +
+        '<a class="ptpl-act" onclick="kbTest(' + k.id + ')">召回测试</a>' +
+        '<a class="ptpl-act" style="color:var(--red)" onclick="kbDel(' + k.id + ',\'' + esc(k.name) + '\')">删除</a>' +
+        '</div></div>';
+    });
+    h += '</div>';
+  }
+  h += renderKBTestPanel();
+  return h;
+}
+
+function renderKBDetail(){
+  const k = KB.list.filter(x => x.id === KB.cur)[0] || {name:'', description:''};
+  let h = '<div class="card"><div class="row" style="align-items:center;flex-wrap:wrap">' +
+    '<a class="ptpl-act" onclick="KB.cur=null;kbRepaint()">← 返回</a>' +
+    '<b style="font-size:15px;margin-left:8px">📚 ' + esc(k.name) + '</b>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    '<button class="ghost sm" onclick="kbTest(' + k.id + ')">召回测试</button>' +
+    '<label class="sm" style="margin-left:8px;cursor:pointer">+ 上传文档' +
+    '<input type="file" style="display:none" multiple accept=".md,.txt,.markdown,.docx,.pdf,.html,.htm,.csv,.log" onchange="kbUpload(this)"></label>' +
+    '</div><div class="small" style="color:var(--dim);margin-top:6px">' + esc(k.description || '') + '</div></div>';
+  if(!KB.docs.length){
+    h += '<div class="empty">还没有文档，点击右上角上传</div>';
+  }else{
+    h += '<div class="card"><table><tr><th>文档名</th><th style="width:70px">类型</th><th style="width:80px">切片</th><th style="width:90px">大小</th><th style="width:80px">操作</th></tr>';
+    KB.docs.forEach(d => {
+      h += '<tr><td>' + esc(d.name) + '</td><td>' + esc(d.ext) + '</td>' +
+        '<td>' + (d.chunk_count||0) + '</td><td class="small" style="color:var(--dim)">' + kbSize(d.size) + '</td>' +
+        '<td><a class="ptpl-act" style="color:var(--red)" onclick="kbDelDoc(' + d.id + ')">删除</a></td></tr>';
+    });
+    h += '</table></div>';
+  }
+  h += renderKBTestPanel();
+  return h;
+}
+
+function renderKBTestPanel(){
+  if(!KB.testing) return '';
+  let h = '<div class="card" id="kbTestBox"><b>召回测试</b>' +
+    '<div class="small" style="color:var(--dim);margin:4px 0 8px">输入问题验证检索效果：命中片段、得分与来源。检索配置与对话一致。</div>' +
+    '<div class="row" style="gap:8px;flex-wrap:wrap">' +
+    '<input class="ptpl-q" id="kbTestQ" placeholder="输入测试问题" style="flex:1;min-width:220px" value="' + esc(KB.q) + '">' +
+    '<select class="ptpl-sel" id="kbTestK">' + [3,5,10].map(n => '<option' + (n===KB.topk?' selected':'') + '>' + n + '</option>').join('') + '</select>' +
+    '<button class="sm" onclick="kbRunTest()">测试</button>' +
+    '<button class="ghost sm" onclick="KB.testing=false;KB.hits=[];kbRepaint()">收起</button></div>';
+  if(KB.hits.length){
+    h += '<div style="margin-top:10px">';
+    KB.hits.forEach((x, i) => {
+      h += '<div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px">' +
+        '<div class="row"><span class="chip">得分 ' + x.score + '</span>' +
+        '<span class="small" style="margin-left:8px">' + esc(x.doc) + (x.heading ? ' · ' + esc(x.heading) : '') + '</span></div>' +
+        '<div class="small" style="margin-top:6px;color:var(--dim);line-height:1.7">' + esc(x.snippet) + '</div></div>';
+    });
+    h += '</div>';
+  }else if(KB.q && KB.hits.length === 0 && KB.tested){
+    h += '<div class="small" style="color:var(--amber);margin-top:8px">无召回结果——考虑调整文档内容或切分</div>';
+  }
+  return h + '</div>';
+}
+
+function kbTest(id){ KB.testing = true; KB.cur = id; kbOpen(id, true); }
+function kbTestAll(){ KB.testing = true; KB.cur = null; kbRepaint(); }
+async function kbRunTest(){
+  KB.q = ($('kbTestQ').value || '').trim();
+  KB.topk = +$('kbTestK').value;
+  if(!KB.q) return;
+  const ids = KB.cur ? [KB.cur] : KB.list.map(k => k.id);
+  try{
+    const d = await api('/api/kbs/search', {method:'POST', body:JSON.stringify({kb_ids:ids, q:KB.q, top_k:KB.topk})});
+    KB.hits = d.items || []; KB.tested = true;
+  }catch(e){ kbToast(e.message); }
+  kbRepaint();
+  const box = $('kbTestBox'); if(box) box.scrollIntoView({behavior:'smooth'});
+  const q = $('kbTestQ'); if(q) q.focus();
+}
+async function kbOpen(id, keep){
+  KB.cur = id; KB.testing = !!keep;
+  try{ const d = await api('/api/kbs/' + id + '/docs'); KB.docs = d.items || []; }catch(e){ KB.docs = []; }
+  if(!keep){ const v = $('view'); if(v && S.tab === 'kb') v.innerHTML = renderKB(); } else kbRepaint();
+}
+async function kbUpload(input){
+  if(!input.files || !input.files.length) return;
+  for(const f of input.files){
+    kbToast('正在上传解析：' + f.name);
+    const fd = new FormData();
+    fd.append('file', f);
+    try{
+      const h = {'Authorization': 'Bearer ' + API_TOKEN};
+      try{ const _op = JSON.parse(localStorage.getItem('af_operator') || 'null');
+           if(_op && _op.id){ h['X-Operator'] = encodeURIComponent(_op.id); h['X-Operator-Name'] = encodeURIComponent(_op.name || _op.id); } }catch(e){}
+      const r = await fetch('/api/kbs/' + KB.cur + '/docs', {method:'POST', headers:h, body:fd});
+      const t = await r.text();
+      if(!r.ok){ let m = t; try{ m = JSON.parse(t).detail || t; }catch(e){} kbToast(String(m).slice(0,200)); }
+      else{ const j = JSON.parse(t); kbToast(f.name + ' 已入库（' + j.chunks + ' 个切片）'); }
+    }catch(e){ kbToast(e.message); }
+  }
+  kbOpen(KB.cur, KB.testing);
+}
+function kbNew(){
+  const name = prompt('知识库名称：');
+  if(!name) return;
+  api('/api/kbs', {method:'POST', body:JSON.stringify({name, description:''})}).then(() => kbGo()).catch(e => kbToast(e.message));
+}
+async function kbDel(id, name){
+  if(!confirm('删除知识库「' + name + '」及其全部文档？')) return;
+  try{ await api('/api/kbs/' + id, {method:'DELETE'}); KB.cur = null; kbGo(); }
+  catch(e){ kbToast(e.message); }
+}
+async function kbDelDoc(did){
+  if(!confirm('删除该文档及其切片？')) return;
+  try{ await api('/api/kbs/' + KB.cur + '/docs/' + did, {method:'DELETE'}); kbOpen(KB.cur, KB.testing); }
+  catch(e){ kbToast(e.message); }
+}
+
+/* ------------------------------------------------------------ 工作流（画布编排） */
+const WFL = {list:[], cur:null, spec:null, sel:null, drag:null, testing:false};
+
+async function viewWF(v, seq){
+  await wfLoadList();
+  setView(v, seq, renderWFList());
+}
+async function wfLoadList(){
+  try{ const d = await api('/api/wf'); WFL.list = d.items || []; }catch(e){ WFL.list = []; }
+}
+function wfToast(t){ wtToast(t); }
+
+function renderWFList(){
+  let h = '<div class="card"><div class="row" style="align-items:center;flex-wrap:wrap">' +
+    '<b style="font-size:15px">工作流</b>' +
+    '<span class="small" style="margin-left:10px">画布编排多步骤流程：大模型 / 知识检索 / 条件分支 / Widget 卡片，可调试运行</span>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    '<button class="ghost sm" onclick="wfNew()">+ 新建工作流</button>' +
+    '</div></div>';
+  if(!WFL.list.length){
+    h += '<div class="empty">还没有工作流</div>';
+  }else{
+    h += '<div class="wt-grid">';
+    WFL.list.forEach(w => {
+      h += '<div class="wt-card">' +
+        '<div class="row" style="align-items:center"><b style="font-size:13.5px">🔀 ' + esc(w.name) + '</b>' +
+        '<span class="spacer" style="flex:1"></span>' +
+        (w.builtin ? '<span class="chip">内置</span>' : '') + '</div>' +
+        '<div class="small" style="color:var(--dim);margin:6px 0;min-height:32px">' + esc(w.description || '') + '</div>' +
+        '<div class="row" style="margin-top:10px;gap:10px">' +
+        '<a class="ptpl-act" onclick="wfOpen(' + w.id + ')">打开画布</a>' +
+        '<a class="ptpl-act" onclick="wfDup(' + w.id + ')">复制</a>' +
+        (!w.builtin ? '<a class="ptpl-act" style="color:var(--red)" onclick="wfDel(' + w.id + ')">删除</a>' : '') +
+        '</div></div>';
+    });
+    h += '</div>';
+  }
+  return h;
+}
+
+async function wfOpen(id){
+  try{
+    const w = await api('/api/wf/' + id);
+    WFL.cur = w; WFL.spec = w.spec || {nodes:[], edges:[]};
+    WFL.testing = false;
+    const v = $('view');
+    if(v && S.tab === 'wf') v.innerHTML = renderWFEditor();
+  }catch(e){ wfToast(e.message); }
+}
+function wfNew(){
+  const name = prompt('工作流名称：');
+  if(!name) return;
+  const spec = {nodes:[{id:'n1', type:'start', name:'开始', x:60, y:160, config:{vars:[{key:'input', label:'输入', type:'text'}]}},
+                       {id:'n2', type:'reply', name:'回复', x:520, y:160, config:{template:'{{n1}}'}}],
+                edges:[{from:'n1', to:'n2'}]};
+  api('/api/wf', {method:'POST', body:JSON.stringify({name, description:'', spec_json:JSON.stringify(spec)})})
+    .then(r => wfOpen(r.id)).catch(e => wfToast(e.message));
+}
+async function wfDup(id){
+  try{ const r = await api('/api/wf/' + id + '/duplicate', {method:'POST', body:'{}'}); wfToast('已复制'); wfOpen(r.id); }
+  catch(e){ wfToast(e.message); }
+}
+async function wfDel(id){
+  if(!confirm('删除该工作流？')) return;
+  try{ await api('/api/wf/' + id, {method:'DELETE'}); WFL.cur = null; viewWF($('view'), renderSeq); }
+  catch(e){ wfToast(e.message); }
+}
+
+const WF_ICONS = {start:'▶', llm:'🤖', kb_search:'📚', condition:'⑃', widget:'🧩', reply:'💬', end:'⏹'};
+const WF_LABELS = {start:'开始', llm:'大模型', kb_search:'知识检索', condition:'条件判断', widget:'Widget卡片', reply:'回复', end:'结束'};
+
+function renderWFEditor(){
+  const w = WFL.cur, spec = WFL.spec;
+  let h = '<div class="card"><div class="row" style="align-items:center;flex-wrap:wrap">' +
+    '<a class="ptpl-act" onclick="WFL.cur=null;viewWF($(\'view\'),renderSeq)">← 返回</a>' +
+    '<b style="font-size:15px;margin-left:8px">🔀 ' + esc(w.name) + (w.builtin ? '（内置·只读）' : '') + '</b>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    '<button class="ghost sm" onclick="wfTestPanel()">▶ 试运行</button>' +
+    (w.builtin ? '<button class="ghost sm" style="margin-left:8px" onclick="wfDup(' + w.id + ')">另存副本</button>'
+               : '<button class="sm" style="margin-left:8px" onclick="wfSave()">保存</button>') +
+    '</div>' +
+    '<div class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">' +
+    '<span class="small" style="margin-right:4px">添加节点：</span>' +
+    Object.keys(WF_LABELS).filter(t => t !== 'start').map(t =>
+      '<button class="ghost sm" onclick="wfAddNode(\'' + t + '\')">+ ' + WF_LABELS[t] + '</button>').join('') +
+    '<span class="small" style="margin-left:12px">拖动节点移动 · 点击节点配置/连线 · 点击连线删除</span>' +
+    '</div></div>';
+  h += '<div class="card"><div class="wf-canvas" id="wfCanvas">' +
+    '<svg id="wfSvg" class="wf-svg"></svg>' +
+    spec.nodes.map(n => wfNodeHTML(n)).join('') +
+    '</div></div>';
+  h += '<div id="wfTestBox"></div>';
+  h += '<div id="wfCfgBox"></div>';
+  return h;
+}
+
+function wfNodeHTML(n){
+  return '<div class="wf-node t-' + n.type + '" id="wn_' + n.id + '" style="left:' + (n.x||40) + 'px;top:' + (n.y||40) + 'px" ' +
+    'onmousedown="wfDragStart(event,\'' + n.id + '\')" onclick="wfNodeClick(event,\'' + n.id + '\')">' +
+    '<div class="wf-node-head">' + (WF_ICONS[n.type]||'·') + ' ' + esc(n.name) + '</div>' +
+    '<div class="wf-node-type">' + WF_LABELS[n.type] + '</div>' +
+    '<div class="wf-port in" title="入口"></div>' +
+    '<div class="wf-port out" title="拖到目标节点连线" onmousedown="wfLinkStart(event,\'' + n.id + '\')"></div>' +
+    '</div>';
+}
+
+function wfDrawEdges(){
+  const svg = $('wfSvg'); if(!svg) return;
+  let h = '';
+  (WFL.spec.edges || []).forEach((e, i) => {
+    const a = wfNodePos(e.from), b = wfNodePos(e.to);
+    if(!a || !b) return;
+    const x1 = a.x + 170, y1 = a.y + 28, x2 = b.x, y2 = b.y + 28;
+    const mx = (x1 + x2) / 2;
+    h += '<path d="M' + x1 + ',' + y1 + ' C' + mx + ',' + y1 + ' ' + mx + ',' + y2 + ' ' + x2 + ',' + y2 + '" ' +
+      'class="wf-edge" onclick="wfDelEdge(' + i + ')"><title>点击删除连线</title></path>';
+  });
+  svg.innerHTML = h;
+}
+function wfNodePos(id){
+  const el = $('wn_' + id);
+  if(!el) return null;
+  return {x: parseInt(el.style.left), y: parseInt(el.style.top)};
+}
+
+function wfDragStart(ev, id){
+  if(ev.target.classList.contains('wf-port')) return;
+  const el = $('wn_' + id);
+  WFL.drag = {id, el, dx: ev.clientX - el.offsetLeft, dy: ev.clientY - el.offsetTop};
+  const move = e => {
+    if(!WFL.drag) return;
+    WFL.drag.el.style.left = Math.max(0, e.clientX - WFL.drag.dx) + 'px';
+    WFL.drag.el.style.top = Math.max(0, e.clientY - WFL.drag.dy) + 'px';
+    wfDrawEdges();
+  };
+  const up = () => {
+    WFL.drag = null;
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    wfSyncPositions();
+  };
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+}
+function wfLinkStart(ev, fromId){
+  ev.stopPropagation();
+  const move = e => {
+    const t = document.elementFromPoint(e.clientX, e.clientY);
+    const node = t && t.closest ? t.closest('.wf-node') : null;
+    document.querySelectorAll('.wf-node.link-target').forEach(x => x.classList.remove('link-target'));
+    if(node) node.classList.add('link-target');
+  };
+  const up = e => {
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    const t = document.elementFromPoint(e.clientX, e.clientY);
+    const node = t && t.closest ? t.closest('.wf-node') : null;
+    document.querySelectorAll('.wf-node.link-target').forEach(x => x.classList.remove('link-target'));
+    if(node){
+      const toId = node.id.slice(3);
+      if(toId !== fromId){
+        const exists = (WFL.spec.edges||[]).some(x => x.from === fromId && x.to === toId);
+        if(!exists){ (WFL.spec.edges = WFL.spec.edges || []).push({from:fromId, to:toId}); wfDrawEdges(); }
+      }
+    }
+  };
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+}
+function wfSyncPositions(){
+  (WFL.spec.nodes || []).forEach(n => {
+    const el = $('wn_' + n.id);
+    if(el){ n.x = parseInt(el.style.left); n.y = parseInt(el.style.top); }
+  });
+}
+function wfDelEdge(i){
+  if(!WFL.cur.builtin){ WFL.spec.edges.splice(i, 1); wfDrawEdges(); }
+}
+function wfAddNode(type){
+  if(WFL.cur.builtin){ wfToast('内置工作流只读，请先「另存副本」'); return; }
+  const id = 'n' + Date.now().toString(36);
+  const name = WF_LABELS[type];
+  const cfg = type === 'llm' ? {prompt:'请处理：{{input.input}}'}
+    : type === 'kb_search' ? {kb_id:(KB.list[0]||{}).id || 1, query:'{{input.input}}', top_k:5}
+    : type === 'condition' ? {var:'{{input.input}}', rules:[{contains:'', to:''}], default_to:''}
+    : type === 'widget' ? {spec:{type:'info', icon:'📋', title:'标题', desc:'说明'}}
+    : type === 'reply' ? {template:'{{input.input}}'} : {};
+  WFL.spec.nodes.push({id, type, name, x: 240 + (WFL.spec.nodes.length % 4) * 190, y: 60 + Math.floor(WFL.spec.nodes.length / 4) * 110, config: cfg});
+  const v = $('view'); if(v) v.innerHTML = renderWFEditor();
+}
+
+function wfNodeClick(ev, id){
+  if(WFL.drag) return;
+  const n = WFL.spec.nodes.filter(x => x.id === id)[0];
+  if(!n) return;
+  let h = '<div class="card"><div class="row"><b>' + WF_LABELS[n.type] + ' · ' + esc(n.name) + '</b>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    (WFL.cur.builtin ? '<span class="chip">内置只读</span>' : '') + '</div>' +
+    '<div id="wfCfgMsg" style="margin:8px 0"></div>';
+  const dis = WFL.cur.builtin ? ' disabled' : '';
+  if(!WFL.cur.builtin){
+    h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
+      '<input id="wfName" placeholder="节点名称" value="' + esc(n.name) + '">' +
+      '<button class="ghost" style="color:var(--red)" onclick="wfDelNode(\'' + id + '\')">删除节点</button></div>';
+  }
+  const cfg = n.config || {};
+  if(n.type === 'llm'){
+    h += '<textarea id="wfPrompt" class="ptpl-ta" style="min-height:140px;margin-top:10px"' + dis + '>' + esc(cfg.prompt||'') + '</textarea>' +
+      '<div class="small" style="color:var(--dim);margin-top:4px">模板可用 {{input.xxx}}（输入变量）、{{节点id}}（上游节点输出）</div>';
+  }else if(n.type === 'kb_search'){
+    h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">' +
+      '<select id="wfKb"' + dis + '>' + (KB.list.length?KB.list.map(k => '<option value="' + k.id + '"' + (k.id===cfg.kb_id?' selected':'') + '>' + esc(k.name) + '</option>').join(''):'<option value="1">（未加载知识库）</option>') + '</select>' +
+      '<input id="wfTopk" placeholder="top_k" value="' + (cfg.top_k||5) + '"' + dis + '></div>' +
+      '<input id="wfQuery" placeholder="检索 query 模板，如 {{input.question}}" style="margin-top:10px;width:100%" value="' + esc(cfg.query||'') + '"' + dis + '>';
+  }else if(n.type === 'condition'){
+    h += '<input id="wfCondVar" placeholder="判断变量，如 {{n2}}" style="margin-top:10px;width:100%" value="' + esc(cfg.var||'') + '"' + dis + '>';
+    (cfg.rules||[]).forEach((r, i) => {
+      h += '<div class="row" style="gap:8px;margin-top:8px">' +
+        '<input class="wf-mini" placeholder="包含关键词" value="' + esc(r.contains||'') + '"' + dis + ' onchange="WFL.spec.nodes.filter(x=>x.id===\'' + id + '\')[0].config.rules[' + i + '].contains=this.value">' +
+        '<input class="wf-mini" placeholder="跳转到节点id" value="' + esc(r.to||'') + '"' + dis + ' onchange="WFL.spec.nodes.filter(x=>x.id===\'' + id + '\')[0].config.rules[' + i + '].to=this.value"></div>';
+    });
+    h += '<input id="wfCondDef" placeholder="默认跳转到节点id" style="margin-top:8px;width:100%" value="' + esc(cfg.default_to||'') + '"' + dis + '>';
+  }else if(n.type === 'widget'){
+    h += '<textarea id="wfWspec" class="ptpl-ta" style="min-height:120px;margin-top:10px"' + dis + '>' + esc(JSON.stringify(cfg.spec||{}, null, 2)) + '</textarea>';
+  }else if(n.type === 'reply'){
+    h += '<textarea id="wfTpl" class="ptpl-ta" style="min-height:100px;margin-top:10px"' + dis + '>' + esc(cfg.template||'') + '</textarea>';
+  }else if(n.type === 'start'){
+    h += '<div class="small" style="margin-top:8px;color:var(--dim)">输入变量（试运行表单由此生成）：JSON 数组，每项 {key,label,type}</div>' +
+      '<textarea id="wfVars" class="ptpl-ta" style="min-height:100px;margin-top:6px"' + dis + '>' + esc(JSON.stringify(cfg.vars||[], null, 2)) + '</textarea>';
+  }
+  if(!WFL.cur.builtin){
+    h += '<div class="row" style="margin-top:12px;justify-content:flex-end">' +
+      '<button class="ghost" onclick="wfCfgClose()">关闭</button>' +
+      '<button class="sm" style="margin-left:8px" onclick="wfCfgSave(\'' + id + '\')">保存配置</button></div>';
+  }else{
+    h += '<div class="row" style="margin-top:12px"><button class="ghost" onclick="wfCfgClose()">关闭</button></div>';
+  }
+  h += '</div>';
+  $('wfCfgBox').innerHTML = h;
+}
+function wfCfgClose(){ $('wfCfgBox').innerHTML = ''; }
+function wfDelNode(id){
+  WFL.spec.nodes = WFL.spec.nodes.filter(n => n.id !== id);
+  WFL.spec.edges = (WFL.spec.edges || []).filter(e => e.from !== id && e.to !== id);
+  $('wfCfgBox').innerHTML = '';
+  $('view').innerHTML = renderWFEditor();
+}
+function wfCfgSave(id){
+  const n = WFL.spec.nodes.filter(x => x.id === id)[0];
+  try{
+    n.name = ($('wfName').value || n.name).trim() || n.name;
+    if(n.type === 'llm') n.config.prompt = $('wfPrompt').value;
+    else if(n.type === 'kb_search'){ n.config.kb_id = +$('wfKb').value; n.config.top_k = +$('wfTopk').value || 5; n.config.query = $('wfQuery').value; }
+    else if(n.type === 'condition'){ n.config.var = $('wfCondVar').value; n.config.default_to = $('wfCondDef').value.trim(); }
+    else if(n.type === 'widget'){ n.config.spec = JSON.parse($('wfWspec').value); }
+    else if(n.type === 'reply'){ n.config.template = $('wfTpl').value; }
+    else if(n.type === 'start'){ n.config.vars = JSON.parse($('wfVars').value || '[]'); }
+  }catch(e){ msg('wfCfgMsg', 'err', '配置不合法：' + e.message); return; }
+  wfCfgClose();
+  $('view').innerHTML = renderWFEditor();
+  wfToast('节点已更新（记得点「保存」持久化）');
+}
+async function wfSave(){
+  wfSyncPositions();
+  try{
+    await api('/api/wf/' + WFL.cur.id, {method:'PUT', body:JSON.stringify({
+      name: WFL.cur.name, description: WFL.cur.description || '',
+      spec_json: JSON.stringify(WFL.spec)})});
+    wfToast('已保存');
+  }catch(e){ wfToast(e.message); }
+}
+function wfTestPanel(){
+  const start = WFL.spec.nodes.filter(n => n.type === 'start')[0];
+  let h = '<div class="card"><b>▶ 试运行</b>' +
+    '<div class="small" style="color:var(--dim);margin:4px 0 8px">输入变量按开始节点定义生成，执行过程逐步展示</div>';
+  (start && (start.config||{}).vars || []).forEach(v => {
+    h += '<div class="wg-field"><label>' + esc(v.label || v.key) + '</label>' +
+      '<input class="wg-in" id="wfi_' + esc(v.key) + '" placeholder="' + esc(v.label||'') + '"></div>';
+  });
+  if(!(start && (start.config||{}).vars && start.config.vars.length)){
+    h += '<div class="small" style="color:var(--amber)">开始节点未定义输入变量（在节点配置中添加 vars）</div>';
+  }
+  h += '<button class="sm" style="margin-top:8px" onclick="wfRun(' + WFL.cur.id + ')">运行</button>' +
+    '<div id="wfRunOut" style="margin-top:12px"></div></div>';
+  $('wfTestBox').innerHTML = h;
+}
+async function wfRun(id){
+  const start = WFL.spec.nodes.filter(n => n.type === 'start')[0];
+  const inputs = {};
+  (start && (start.config||{}).vars || []).forEach(v => {
+    const el = $('wfi_' + v.key);
+    if(el) inputs[v.key] = el.value;
+  });
+  $('wfRunOut').innerHTML = '<div class="small" style="color:var(--dim)">执行中…</div>';
+  try{
+    const r = await api('/api/wf/' + id + '/run', {method:'POST', body:JSON.stringify({inputs})});
+    let h = '<div class="row" style="gap:8px;flex-wrap:wrap">' + (r.log||[]).map(l =>
+      '<span class="chip">' + (WF_ICONS[l.type]||'·') + ' ' + esc(l.node) + ' ' + l.ms + 'ms' + (l.detail?' · '+esc(l.detail):'') + '</span>').join('') +
+      '<span class="chip chip-on">共 ' + r.ms + 'ms</span></div>';
+    if(r.widget) h += wgCardHTML(r.widget, 'wfrun' + Date.now(), false);
+    h += '<div class="ptpl-pre" style="margin-top:10px">' + esc(r.output||'') + '</div>';
+    $('wfRunOut').innerHTML = h;
+  }catch(e){
+    $('wfRunOut').innerHTML = '<div class="err">执行失败：' + esc(e.message) + '</div>';
+  }
+}
+
+/* ------------------------------------------------------------ 聊天记忆面板 */
+async function openMemory(){
+  const agentId = CS.agentId || '';
+  try{
+    const m = await api('/api/memory' + (agentId ? ('?agent_id=' + encodeURIComponent(agentId)) : ''));
+    openModal('<div class="row"><b>🧠 长期记忆</b><span class="spacer" style="flex:1"></span>' +
+      '<span class="small">当前智能体' + (agentId ? '：' + esc(agentId) : '（默认）') + ' · 对话后自动沉淀</span></div>' +
+      '<div id="memMsg" style="margin:8px 0"></div>' +
+      '<textarea id="memContent" class="ptpl-ta" style="min-height:220px">' + esc(m.content || '') + '</textarea>' +
+      '<div class="small" style="color:var(--dim);margin-top:6px">记忆会在每轮对话后由模型自动总结更新；你也可以手工编辑。新对话发起时自动注入。</div>' +
+      '<div class="row" style="margin-top:12px;justify-content:flex-end">' +
+      '<button class="ghost" onclick="closeModal()">关闭</button>' +
+      '<button class="sm" style="margin-left:8px" onclick="saveMemory()">保存</button></div>');
+  }catch(e){ wtToast(e.message); }
+}
+async function saveMemory(){
+  const agentId = CS.agentId || '';
+  try{
+    await api('/api/memory', {method:'PUT', body:JSON.stringify({agent_id:agentId, content:$('memContent').value})});
+    closeModal(); wtToast('记忆已保存');
+  }catch(e){ msg('memMsg', 'err', e.message); }
+}
+
+/* ---------- 智能体编辑器：知识库绑定区块 ---------- */
+async function kbEnsure(){
+  if(!KB.list.length){ try{ const d = await api('/api/kbs'); KB.list = d.items || []; }catch(e){} }
+}
+function kbBindHTML(E){
+  const sel = E.knowledge_bases || [];
+  const items = (KB.list && KB.list.length) ? KB.list.map(k =>
+    '<div class="chk' + (sel.indexOf(k.id) >= 0 ? ' on' : '') + '" onclick="toggleItem(&#39;knowledge_bases&#39;,' + k.id + ',this)">' +
+    '<input type="checkbox"' + (sel.indexOf(k.id) >= 0 ? ' checked' : '') + '>' +
+    '<div><b>📚 ' + esc(k.name) + '</b><div class="small">' + (k.doc_count || 0) + ' 篇文档 · ' + (k.chunk_count || 0) + ' 切片</div></div></div>').join('')
+    : '<div class="small" style="color:var(--dim)">暂无知识库，请先到「知识库」菜单创建</div>';
+  return '<div class="field"><label>知识库绑定 - 对话时自动检索注入（RAG）</label>' +
+    '<div class="small" style="margin:-2px 0 8px">勾选后该智能体每轮对话自动检索所选知识库的 top5 片段作为参考资料</div>' +
+    '<div class="grid g2">' + items + '</div></div>';
 }
 
 </script>

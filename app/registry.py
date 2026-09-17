@@ -37,6 +37,7 @@ DEFAULT_PERSONA = "你是资深业务专家，回答需结构清晰、结论先�
 
 
 SPEC_KEYS = ("id", "name", "icon", "category", "description", "persona", "skills", "tools",
+             "knowledge_bases",
 
              "runtime", "output", "input_schema", "params", "model", "temperature")
 
