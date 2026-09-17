@@ -3,9 +3,9 @@ logs/
 data/
 __pycache__/
 *.pyc
-*.bak
-*.bak.*
-*.b*
+*bak*
+*bak.*
+*pre
 *.db
 *.db.*
 .DS_Store

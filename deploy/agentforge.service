@@ -1,0 +1,19 @@
+# /etc/systemd/system/agentforge.service 参考模板
+# 部署时把 <YOUR_API_TOKEN> 替换为自定义鉴权 token（前端 API_TOKEN 需一致）
+[Unit]
+Description=AgentForge Multi-Agent Platform
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agentforge
+Environment=AGENTFORGE_HOME=/opt/agentforge
+Environment=AGENTFORGE_API_TOKEN=<YOUR_API_TOKEN>
+ExecStart=/opt/agentforge/venv/bin/python -m uvicorn app.api:app --host 0.0.0.0 --port 8080 --workers 1
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/agentforge/logs/agentforge.log
+StandardError=append:/opt/agentforge/logs/agentforge.log
+
+[Install]
+WantedBy=multi-user.target
