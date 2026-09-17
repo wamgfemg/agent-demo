@@ -33,3 +33,4 @@ sudo systemctl enable --now agentforge
 
 ## LLM 配置
 登录后在「设置」里配置 OpenRouter API Key 与模型（存 data/agentforge.db）。
+# sync test 1789651264
