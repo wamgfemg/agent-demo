@@ -1,0 +1,11 @@
+venv/
+logs/
+data/
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+*.b*
+*.db
+*.db.*
+.DS_Store

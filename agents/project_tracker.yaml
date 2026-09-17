@@ -1,0 +1,23 @@
+id: project_tracker
+name: 项目跟踪智能体
+icon: 📌
+category: 项目管理
+description: 汇总项目信息生成跟踪报告：进度、风险、待办、下周计划
+runtime: report
+output: markdown
+persona: |
+  你是项目管理专家，按周报口径输出：先结论后细节，风险必须标注等级与责任人建议，
+  待办项要可验收、可追踪。
+model: ''   # 留空=跟随全局默认模型
+input_schema:
+  - key: data
+    label: 项目信息
+    type: textarea
+    required: true
+    placeholder: 粘贴本周进展、问题、会议纪要等原始信息
+params: {}
+skills:
+  - bid_writing
+tools:
+  - file_write
+  - python_sandbox

@@ -1,0 +1,1387 @@
+# -*- coding: utf-8 -*-
+
+"""AgentForge API 层：FastAPI 单进程，SQLite 兼作队列，asyncio 并发执行。"""
+
+import os, json, time, asyncio
+
+from fastapi import FastAPI, HTTPException
+
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+from pydantic import BaseModel
+
+from typing import Optional, Dict, Any, List
+
+
+
+from . import (db, registry, pipeline, llm, toolregistry, mcp, runtime, models,
+
+               skills as skilllib)
+
+from .config import WEB_DIR, ARTIFACT_DIR, AGENT_DIR
+
+
+
+app = FastAPI(title="AgentForge", version="2.0.0")
+
+# ================================================================== 鉴权网关（P1-1）
+# 设置环境变量 AGENTFORGE_API_TOKEN 后，除 /api/health 外的所有 /api/* 必须携带
+# `Authorization: Bearer <token>`，否则返回 401。未设置该变量时网关自动关闭，向后兼容。
+API_TOKEN = os.environ.get("AGENTFORGE_API_TOKEN")
+_AUTH_SKIP = {"/api/health"}
+
+
+@app.middleware("http")
+async def _auth_gate(request, call_next):
+    if not API_TOKEN:
+        return await call_next(request)
+    path = request.url.path
+    if not path.startswith("/api/") or path in _AUTH_SKIP:
+        return await call_next(request)
+    if request.headers.get("Authorization") == "Bearer " + API_TOKEN:
+        return await call_next(request)
+    return JSONResponse({"ok": False, "error": "未授权：缺少或错误的 API Token"},
+                        status_code=401)
+
+
+
+
+
+
+
+@app.on_event("startup")
+
+async def _startup():
+
+    db.init_db()
+
+    toolregistry.register_builtin()          # 先注册内置工具
+
+    await mcp.connect_all()                  # 再接入 MCP server（其工具进入同一注册中心）
+
+    registry.load_agents()                   # 最后加载智能体，可校验工具/技能引用是否命中
+
+    pipeline.resume_interrupted()
+
+    asyncio.create_task(pipeline.scheduler())
+
+    print("[agentforge] started, agents:", len(registry.list_agents()),
+
+          "tools:", len(toolregistry.list_tools()))
+
+
+
+
+
+@app.get("/", response_class=HTMLResponse)
+
+def index():
+
+    p = os.path.join(WEB_DIR, "index.html")
+
+    if not os.path.exists(p):
+
+        return HTMLResponse("<h3>前端未部署</h3>")
+
+    # 禁用缓存：前端更新后浏览器必须立刻拿到新版本，否则会看到旧页面
+
+    return HTMLResponse(open(p, "r", encoding="utf-8").read(),
+
+                        headers={"Cache-Control": "no-store, must-revalidate",
+
+                                 "Pragma": "no-cache", "Expires": "0"})
+
+
+
+
+
+@app.get("/api/health")
+
+def health():
+
+    cfg = db.all_settings()
+
+    return {"ok": True, "mocked": llm.is_mocked(), "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+
+            "model": models.resolve(), "configured": bool((cfg.get("llm_api_key") or "").strip()),
+
+            "strong": cfg.get("llm_model_strong") or ""}
+
+
+
+
+
+# ================================================================== 智能体
+
+@app.get("/api/catalog")
+
+def catalog():
+
+    """构建器用到的下拉数据：执行引擎、输出类型、技能、工具。"""
+
+    return {"runtimes": runtime.RUNTIMES, "outputs": runtime.OUTPUTS,
+
+            "skills": skilllib.list_skills(), "tools": toolregistry.list_tools()}
+
+
+
+
+
+@app.get("/api/agents")
+
+def agents(scope: str = "all"):
+
+    return {"items": registry.list_agents(scope), "mocked": llm.is_mocked()}
+
+
+
+
+
+class AgentIn(BaseModel):
+
+    id: Optional[str] = None
+
+    name: Optional[str] = None
+
+    icon: Optional[str] = None
+
+    category: Optional[str] = None
+
+    description: Optional[str] = None
+
+    persona: Optional[str] = None
+
+    skills: Optional[List[str]] = None
+
+    tools: Optional[List[str]] = None
+
+    runtime: Optional[str] = None
+
+    output: Optional[str] = None
+
+    input_schema: Optional[List[Dict[str, Any]]] = None
+
+    params: Optional[Dict[str, Any]] = None
+
+    model: Optional[str] = None
+
+    temperature: Optional[float] = None
+
+
+
+
+
+@app.post("/api/agents")
+
+def agent_create(body: AgentIn):
+
+    try:
+
+        return registry.create({k: v for k, v in body.dict().items() if v is not None})
+
+    except ValueError as e:
+
+        raise HTTPException(400, str(e))
+
+
+
+
+
+@app.post("/api/agents/reload")
+
+def reload_agents():
+
+    return {"items": registry.load_agents(force=True)}
+
+
+
+
+
+@app.post("/api/agents/{aid}/clone")
+
+def agent_clone(aid: str):
+
+    try:
+
+        return registry.clone(aid)
+
+    except ValueError as e:
+
+        raise HTTPException(400, str(e))
+
+
+
+
+
+@app.post("/api/agents/{aid}/publish")
+
+def agent_publish(aid: str, body: Dict[str, Any] = None):
+
+    try:
+
+        return registry.publish(aid, (body or {}).get("note", ""))
+
+    except ValueError as e:
+
+        raise HTTPException(400, str(e))
+
+
+
+
+
+@app.post("/api/agents/{aid}/unpublish")
+
+def agent_unpublish(aid: str):
+
+    return registry.unpublish(aid)
+
+
+
+
+
+@app.post("/api/agents/{aid}/archive")
+
+def agent_archive(aid: str):
+
+    registry.archive(aid)
+
+    return {"ok": True}
+
+
+
+
+
+@app.post("/api/agents/{aid}/unarchive")
+def agent_unarchive(aid: str):
+    registry.unarchive(aid)
+    return {"ok": True}
+
+
+@app.post("/api/agents/{aid}/enable")
+
+def agent_enable(aid: str, body: Dict[str, Any] = None):
+
+    registry.enable(aid, bool((body or {}).get("on", True)))
+
+    return {"ok": True}
+
+
+
+
+
+@app.get("/api/agents/{aid}/versions")
+
+def agent_versions(aid: str):
+
+    return {"items": db.agent_versions(aid)}
+
+
+
+
+
+class TestIn(BaseModel):
+
+    input: Dict[str, Any] = {}
+
+    params: Dict[str, Any] = {}
+
+
+
+
+
+@app.post("/api/agents/{aid}/test")
+
+async def agent_test(aid: str, body: TestIn):
+
+    """试运行：同步执行一遍，直接把结果返回给构建者，不进任务中心。"""
+
+    spec = registry.get_agent(aid)
+
+    if not spec:
+
+        raise HTTPException(404, "智能体不存在")
+
+    tid = pipeline.create_task(aid, "试运行 · " + (spec.get("name") or aid), body.input, body.params)
+
+    t0 = time.time()
+
+    await pipeline.execute_task(tid)
+
+    row = db.query_one("SELECT status,error,input_json FROM tasks WHERE id=?", (tid,))
+
+    data = db.uj(row["input_json"]) or {}
+
+    arts = db.query("SELECT id,name,size FROM artifacts WHERE task_id=? ORDER BY created_at", (tid,))
+
+    return {"task_id": tid, "status": row["status"], "error": row["error"],
+
+            "answer": data.get("_answer") or "", "tool_calls": data.get("_trace") or [],
+
+            "artifacts": arts, "seconds": round(time.time() - t0, 2)}
+
+
+
+
+
+@app.get("/api/agents/{aid}")
+
+def agent_detail(aid: str):
+
+    d = registry.detail(aid)
+
+    if not d:
+
+        raise HTTPException(404, "智能体不存在")
+
+    return d
+
+
+
+
+
+@app.put("/api/agents/{aid}")
+
+def agent_update(aid: str, body: AgentIn):
+
+    try:
+
+        return registry.update(aid, {k: v for k, v in body.dict().items() if v is not None})
+
+    except ValueError as e:
+
+        raise HTTPException(400, str(e))
+
+
+
+
+
+@app.delete("/api/agents/{aid}")
+
+def agent_delete(aid: str):
+
+    try:
+
+        registry.delete(aid)
+
+        return {"ok": True}
+
+    except ValueError as e:
+
+        raise HTTPException(400, str(e))
+
+
+
+
+
+@app.post("/api/agents/{aid}/rollback/{ver}")
+def agent_rollback(aid: str, ver: int):
+    try:
+        return registry.rollback(aid, ver)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/agents/{aid}/prompt")
+
+def agent_prompt(aid: str):
+
+    """预览该智能体最终生效的 system prompt（人设 + 技能正文 + 工具清单）。"""
+
+    spec = registry.get_agent(aid)
+
+    if not spec:
+
+        raise HTTPException(404, "智能体不存在")
+
+    base = spec.get("persona") or pipeline.DOC_SYS
+
+    return {"agent_id": aid, "runtime": spec.get("runtime"),
+
+            "skills": spec.get("skills") or [], "tools": spec.get("tools") or [],
+
+            "system": pipeline.build_system(spec, base)}
+
+
+
+
+
+# ================================================================== 工具中心
+
+@app.get("/api/tools")
+
+def list_tools(source: str = None):
+
+    return {"items": toolregistry.list_tools(source), "total": len(toolregistry.list_tools())}
+
+
+
+
+
+class ToolTestIn(BaseModel):
+
+    name: str
+
+    args: Dict[str, Any] = {}
+
+
+
+
+
+@app.post("/api/tools/test")
+
+async def test_tool(body: ToolTestIn):
+
+    r = await toolregistry.call(body.name, body.args, timeout=30)
+
+    db.log_tool_call(None, body.name, (toolregistry.get(body.name) or {}).get("source", "?"),
+
+                     body.args, bool(r.get("ok")), r.get("_ms", 0))
+
+    return r
+
+
+
+
+
+# ================================================================== MCP
+
+@app.get("/api/mcp/servers")
+
+def mcp_list():
+
+    return {"items": mcp.list_servers()}
+
+
+
+
+
+class MCPIn(BaseModel):
+
+    id: Optional[str] = None
+
+    name: str
+
+    transport: str = "http"
+
+    url: Optional[str] = None
+
+    command: Optional[str] = None
+
+    args: Optional[list] = None
+
+    env: Optional[Dict[str, Any]] = None
+
+    headers: Optional[Dict[str, Any]] = None
+
+    enabled: bool = True
+
+
+
+
+
+@app.post("/api/mcp/servers")
+
+async def mcp_save(body: MCPIn):
+
+    sid = mcp.save_server(body.dict())
+
+    if body.enabled:
+
+        res = await mcp.connect_server(sid)
+
+        registry.load_agents()
+
+        return {"ok": True, "id": sid, "connect": res}
+
+    return {"ok": True, "id": sid, "connect": None}
+
+
+
+
+
+@app.post("/api/mcp/servers/test")
+
+async def mcp_test(body: MCPIn):
+
+    return await mcp.test_server(body.dict())
+
+
+
+
+
+@app.post("/api/mcp/servers/{sid}/connect")
+
+async def mcp_connect(sid: str):
+
+    res = await mcp.connect_server(sid)
+
+    registry.load_agents()
+
+    return res
+
+
+
+
+
+@app.delete("/api/mcp/servers/{sid}")
+
+def mcp_delete(sid: str):
+
+    mcp.delete_server(sid)
+
+    registry.load_agents()
+
+    return {"ok": True}
+
+
+
+
+
+# ================================================================== 技能
+
+@app.get("/api/skills")
+
+def skill_list():
+
+    return {"items": skilllib.list_skills()}
+
+
+
+
+
+@app.get("/api/skills/{sid}")
+
+def skill_get(sid: str):
+
+    s = skilllib.get_skill(sid)
+
+    if not s:
+
+        raise HTTPException(404, "技能不存在")
+
+    return s
+
+
+
+
+
+class SkillIn(BaseModel):
+
+    id: str
+
+    name: Optional[str] = None
+
+    description: Optional[str] = None
+
+    body: str = ""
+
+    version: Optional[str] = "1.0"
+
+
+
+
+
+@app.post("/api/skills")
+
+def skill_save(body: SkillIn):
+
+    import re
+
+    if not re.match(r"^[A-Za-z0-9_\-]+$", body.id or ""):
+
+        raise HTTPException(400, "技能 id 只能包含字母数字下划线与短横线")
+
+    r = skilllib.save_skill(body.id, body.name, body.description, body.body, body.version)
+
+    registry.load_agents()
+
+    return {"ok": True, **r}
+
+
+
+
+
+@app.delete("/api/skills/{sid}")
+
+def skill_delete(sid: str):
+
+    ok = skilllib.delete_skill(sid)
+
+    registry.load_agents()
+
+    return {"ok": ok}
+
+
+
+
+
+# ================================================================== 任务
+
+class TaskIn(BaseModel):
+
+    agent_id: str
+
+    title: Optional[str] = None
+
+    input: Dict[str, Any] = {}
+
+    params: Dict[str, Any] = {}
+
+    auto_run: bool = True
+
+    published_only: bool = False
+
+
+
+
+
+@app.get("/api/tasks")
+
+def tasks(limit: int = 30, agent_id: str = None):
+
+    sql = ("SELECT id,agent_id,title,status,progress,stage,created_at,updated_at,error,"
+
+           "tokens_in,tokens_out FROM tasks")
+
+    args = []
+
+    if agent_id:
+
+        sql += " WHERE agent_id=?"
+
+        args.append(agent_id)
+
+    sql += " ORDER BY created_at DESC LIMIT ?"
+
+    args.append(limit)
+
+    return {"items": db.query(sql, args)}
+
+
+
+
+
+@app.post("/api/tasks")
+
+async def create_task(body: TaskIn):
+
+    row = db.query_one("SELECT status,name FROM agents WHERE id=?", (body.agent_id,))
+
+    if not row:
+
+        raise HTTPException(404, "智能体不存在")
+
+    # 业务人员入口强制只跑已发布版本，避免构建中的草稿被误用
+
+    if body.published_only and row["status"] != "published":
+
+        raise HTTPException(403, "该智能体尚未发布，请先在构建器中发布")
+
+    title = body.title or f"{row['name'] or body.agent_id} - {time.strftime('%m-%d %H:%M')}"
+
+    tid = pipeline.create_task(body.agent_id, title, body.input, body.params)
+
+    if body.auto_run:
+
+        try:
+
+            pipeline.start_task(tid)
+
+        except RuntimeError:
+
+            pass
+
+    return {"id": tid}
+
+
+
+
+
+@app.get("/api/tasks/{tid}")
+
+def task_detail(tid: str):
+
+    t = db.query_one("SELECT * FROM tasks WHERE id=?", (tid,))
+
+    if not t:
+
+        raise HTTPException(404, "任务不存在")
+
+    units = db.query("SELECT id,unit_key,seq,title,stage,status,attempt,review_json,"
+
+                     "tokens_in,tokens_out,error FROM task_units WHERE task_id=? ORDER BY seq", (tid,))
+
+    arts = db.query("SELECT id,name,size,mime,created_at FROM artifacts WHERE task_id=? ORDER BY created_at", (tid,))
+
+    gl = db.query("SELECT term,definition FROM glossary WHERE task_id=?", (tid,))
+
+    nb = db.query("SELECT key,value,unit,source FROM numbers WHERE task_id=?", (tid,))
+
+    calls = db.query("SELECT tool,source,ok,ms,created_at,args_json FROM tool_calls "
+
+                     "WHERE task_id=? ORDER BY id DESC LIMIT 50", (tid,))
+
+    return {"task": t, "units": units, "artifacts": arts, "glossary": gl, "numbers": nb,
+
+            "tool_calls": calls, "answer": (db.uj(t["input_json"]) or {}).get("_answer") or ""}
+
+
+
+
+
+@app.post("/api/tasks/{tid}/run")
+
+async def run_task(tid: str):
+
+    t = db.query_one("SELECT status FROM tasks WHERE id=?", (tid,))
+
+    if not t:
+
+        raise HTTPException(404, "任务不存在")
+
+    if t["status"] in ("running",):
+
+        return {"started": False, "reason": "already running"}
+
+    db.update_task(tid, status="queued", error=None)
+
+    ok = pipeline.start_task(tid)
+
+    return {"started": ok}
+
+
+
+
+
+@app.post("/api/tasks/{tid}/cancel")
+
+def cancel_task(tid: str):
+
+    db.update_task(tid, status="canceled", stage="已取消")
+
+    return {"ok": True}
+
+
+
+
+
+@app.post("/api/tasks/{tid}/retry")
+
+async def retry_task(tid: str):
+
+    """只重跑失败或未完成的单元，已完成的章节直接复用。"""
+
+    db.execute("UPDATE task_units SET status='pending',attempt=0,error=NULL "
+
+               "WHERE task_id=? AND status IN ('failed','review_failed','pending','running')", (tid,))
+
+    db.update_task(tid, status="queued", error=None, progress=0)
+
+    ok = pipeline.start_task(tid)
+
+    return {"started": ok}
+
+
+
+
+
+@app.delete("/api/tasks/{tid}")
+
+def delete_task(tid: str):
+
+    db.execute("DELETE FROM task_units WHERE task_id=?", (tid,))
+
+    db.execute("DELETE FROM tool_calls WHERE task_id=?", (tid,))
+
+    db.execute("DELETE FROM glossary WHERE task_id=?", (tid,))
+
+    db.execute("DELETE FROM numbers WHERE task_id=?", (tid,))
+
+    db.execute("DELETE FROM artifacts WHERE task_id=?", (tid,))
+
+    db.execute("DELETE FROM tasks WHERE id=?", (tid,))
+
+    return {"ok": True}
+
+
+
+
+
+@app.get("/api/artifacts/{aid}/download")
+
+def download(aid: str):
+
+    a = db.query_one("SELECT * FROM artifacts WHERE id=?", (aid,))
+
+    if not a or not os.path.exists(a["path"]):
+
+        raise HTTPException(404, "产物不存在")
+
+    return FileResponse(a["path"], filename=a["name"], media_type=a["mime"])
+
+
+
+
+
+# ================================================================== 设置
+
+@app.get("/api/settings")
+
+def get_settings():
+
+    s = db.all_settings()
+
+    masked = dict(s)
+
+    if masked.get("llm_api_key"):
+
+        k = masked["llm_api_key"]
+
+        masked["llm_api_key"] = k[:6] + "..." + k[-4:] if len(k) > 12 else "***"
+
+    return {"settings": masked, "mocked": llm.is_mocked()}
+
+
+
+
+
+class SettingsIn(BaseModel):
+
+    llm_base_url: Optional[str] = None
+
+    llm_api_key: Optional[str] = None
+
+    llm_model: Optional[str] = None
+
+    llm_model_strong: Optional[str] = None
+
+
+
+
+
+@app.post("/api/settings")
+
+def set_settings(body: SettingsIn):
+
+    d = {k: v for k, v in body.dict().items() if v is not None and v != ""}
+
+    if d:
+
+        db.set_settings(d)
+
+    return {"ok": True, "mocked": llm.is_mocked()}
+
+
+
+
+
+@app.post("/api/llm/test")
+
+def test_llm():
+
+    if llm.is_mocked():
+
+        return {"ok": True, "mocked": True, "msg": "当前为模拟模式（未配置密钥）"}
+
+    try:
+
+        r = llm.chat("你是一个测试助手。", "回复 OK 两个字", hint="report")
+
+        return {"ok": True, "mocked": False, "reply": r.content[:200], "model": r.model}
+
+    except Exception as e:
+
+        return {"ok": False, "error": str(e)[:300]}
+
+
+
+
+
+class TestModelIn(BaseModel):
+
+    model: Optional[str] = None
+
+
+
+
+
+@app.post("/api/llm/test-model")
+
+def test_model(body: TestModelIn = None):
+
+    """用指定模型发一次真实请求，验证该模型可用（不落库）。"""
+
+    if llm.is_mocked():
+
+        return {"ok": False, "error": "尚未配置 API Key"}
+
+    model = (body.model if body else None) or models.resolve()
+
+    t0 = time.time()
+
+    try:
+
+        r = llm.chat("你是一个测试助手。", "回复 OK 两个字", model=model, hint="report")
+
+        return {"ok": True, "model": r.model, "reply": r.content[:200],
+
+                "ms": int((time.time() - t0) * 1000),
+
+                "tokens": {"in": r.tokens_in, "out": r.tokens_out}}
+
+    except Exception as e:
+
+        return {"ok": False, "model": model, "error": str(e)[:400]}
+
+
+
+
+
+@app.get("/api/llm/models")
+
+async def llm_models(force: int = 0, q: str = "", free: int = 0,
+
+                     tools: int = 0, top: int = 0):
+
+    """模型目录。force=1 强制刷新；q 搜索；free/tools 过滤；top 截断。"""
+
+    return await asyncio.to_thread(
+
+        models.list_models, bool(force), q or "", bool(free), bool(tools), top or None)
+
+
+
+
+
+@app.get("/api/stats")
+
+def stats():
+
+    t = db.query_one("SELECT COUNT(*) c FROM tasks")
+
+    a = db.query_one("SELECT COUNT(*) c FROM artifacts")
+
+    ag = db.query_one("SELECT COUNT(*) c FROM agents WHERE status='published'")
+
+    tr = db.query_one("SELECT COALESCE(SUM(tokens_in),0) i, COALESCE(SUM(tokens_out),0) o FROM tasks")
+
+    return {"tasks": t["c"], "artifacts": a["c"], "published_agents": ag["c"],
+
+            "tokens_in": tr["i"], "tokens_out": tr["o"]}
+
+
+
+
+
+# ================================================================== 对话（Chat）
+
+class ChatMessageIn(BaseModel):
+
+    conversation_id: Optional[str] = None
+
+    agent_id: str = ""
+
+    message: str
+
+    system_prompt: Optional[str] = None
+
+
+
+
+
+@app.post("/api/chat")
+
+async def chat_endpoint(body: ChatMessageIn):
+
+    """多轮对话：自动创建或复用 conversation，携带历史发给 LLM，返回助手回复。"""
+
+    import uuid
+
+    cid = body.conversation_id
+
+    if not cid:
+
+        # 新建对话
+
+        cid = db.create_conversation(body.agent_id, body.message[:40])
+
+    
+
+    # 保存用户消息
+
+    db.add_chat_message(cid, "user", body.message)
+
+    
+
+    # 构建历史消息列表
+
+    conv_data = db.get_conversation(cid)
+
+    history_msgs = []
+
+    if conv_data:
+
+        for m in conv_data.get("messages", []):
+
+            if m["role"] in ("user", "assistant"):
+
+                history_msgs.append({"role": m["role"], "content": m["content"]})
+
+    
+
+    # 获取智能体 system prompt（如果有）——统一使用发布快照，与任务执行语义一致（P1-3）
+
+    agent_spec = None
+
+    if body.agent_id:
+
+        agent_spec = registry.get_published_or_draft(body.agent_id)
+
+    system = body.system_prompt or (agent_spec.get("persona") if agent_spec else "你是一个有帮助的AI助手。请用中文回答。")
+
+    
+
+    # 调用 LLM（带历史）
+
+    try:
+
+        # 用 chat_messages 方式传入完整历史
+
+        messages = [{"role": "system", "content": system}] + history_msgs
+
+        
+
+        if llm.is_mocked():
+
+            r = llm.chat(system, body.message, hint="chat", ctx={"brief": body.message})
+
+        else:
+
+            r = llm.chat_messages(messages)
+
+        
+
+        # 保存助手回复
+
+        db.add_chat_message(cid, "assistant", r.content, r.model, r.mocked,
+
+                          r.tokens_in, r.tokens_out, r.latency_ms)
+
+        
+
+        return {
+
+            "conversation_id": cid,
+
+            "reply": r.content,
+
+            "model": r.model,
+
+            "mocked": r.mocked,
+
+            "tokens_in": r.tokens_in,
+
+            "tokens_out": r.tokens_out,
+
+        }
+
+    except Exception as e:
+
+        err_msg = str(e)[:500]
+
+        db.add_chat_message(cid, "assistant", "", error=err_msg)
+
+        return {"conversation_id": cid, "error": err_msg, "reply": f"⚠️ 模型调用失败: {err_msg}"}
+
+
+
+
+
+@app.get("/api/conversations")
+
+def list_conversations_api(agent_id: str = None, limit: int = 30):
+
+    return {"items": db.list_conversations(agent_id, limit)}
+
+
+
+
+
+@app.get("/api/conversations/{cid}")
+
+def get_conversation_api(cid: str):
+
+    data = db.get_conversation(cid)
+
+    if not data:
+
+        raise HTTPException(404, "对话不存在")
+
+    return data
+
+
+
+
+
+@app.delete("/api/conversations/{cid}")
+
+def delete_conversation_api(cid: str):
+
+    db.delete_conversation(cid)
+
+    return {"ok": True}
+
+
+
+
+
+@app.post("/api/conversations")
+
+def create_conversation_api(body: dict = None):
+
+    body = body or {}
+
+    cid = db.create_conversation(body.get("agent_id", ""), body.get("title", ""))
+
+    return {"id": cid}
+
+
+
+
+
+# ================================================================== 监控（Langfuse 风格可观测性）
+
+# 各模型单价（USD / 1M tokens: input, output），用于成本估算；匹配不到用默认
+
+MODEL_PRICES = {
+
+    "openai/gpt-4o": (2.5, 10.0),
+
+    "openai/gpt-4o-mini": (0.15, 0.6),
+
+    "anthropic/claude-3.5-sonnet": (3.0, 15.0),
+
+    "anthropic/claude-3-haiku": (0.25, 1.25),
+
+    "google/gemini": (1.25, 5.0),
+
+    "meta-llama/llama-3.1-70b": (0.35, 0.4),
+
+    "deepseek/deepseek-chat": (0.14, 0.28),
+
+    "dots-studio/dots-3-note-preview:free": (0.0, 0.0),
+
+}
+
+DEFAULT_PRICE = (0.5, 1.5)
+
+
+
+
+
+def _price_of(model):
+
+    if not model:
+
+        return DEFAULT_PRICE
+
+    m = (model or "").lower()
+
+    if ":free" in m:
+
+        return (0.0, 0.0)
+
+    for k, v in MODEL_PRICES.items():
+
+        if k.lower() in m:
+
+            return v
+
+    return DEFAULT_PRICE
+
+
+
+
+
+def _obs_sql():
+
+    """统一的 LLM 调用流：对话型(chat) + 任务型(task)，每条 assistant 回复算一次 observation。"""
+
+    return """
+
+    SELECT 'chat' AS src, cm.id AS oid, cm.conversation_id AS session_id, c.agent_id AS agent_id,
+
+           cm.role AS role, cm.model AS model, cm.mocked AS mocked,
+
+           cm.tokens_in AS ti, cm.tokens_out AS to_, cm.latency_ms AS lat, cm.error AS err, cm.created_at AS ts
+
+    FROM chat_messages cm JOIN conversations c ON cm.conversation_id = c.id
+
+    WHERE cm.role = 'assistant'
+
+    UNION ALL
+
+    SELECT 'task' AS src, t.id, t.task_id, tk.agent_id, t.role, t.model, t.mocked,
+
+           t.tokens_in, t.tokens_out, t.latency_ms, NULL, t.created_at
+
+    FROM traces t JOIN tasks tk ON t.task_id = tk.id
+
+    WHERE t.role = 'assistant'
+
+    """
+
+
+
+
+
+@app.get("/api/monitor/overview")
+
+def monitor_overview():
+
+    row = db.query_one(
+
+        "SELECT COUNT(*) n, COALESCE(SUM(ti),0) ti, COALESCE(SUM(to_),0) to_, "
+
+        "COALESCE(AVG(lat),0) lat, "
+
+        "COALESCE(SUM(CASE WHEN err IS NOT NULL AND err<>'' THEN 1 ELSE 0 END),0) errn, "
+
+        "COALESCE(SUM(mocked),0) mockn FROM (" + _obs_sql() + ")")
+
+    ag = db.query_one("SELECT COUNT(DISTINCT agent_id) a FROM conversations WHERE agent_id<>''")
+
+    sess = db.query_one("SELECT COUNT(*) s FROM conversations")
+
+    rows = db.query("SELECT model, ti, to_ FROM (" + _obs_sql() + ")")
+
+    cost = 0.0
+
+    for r in rows:
+
+        pi, po = _price_of(r["model"])
+
+        cost += (r["ti"] * pi + r["to_"] * po) / 1e6
+
+    n = row["n"] or 0
+
+    return {"calls": n, "tokens_in": row["ti"] or 0, "tokens_out": row["to_"] or 0,
+
+            "tokens_total": (row["ti"] or 0) + (row["to_"] or 0),
+
+            "avg_latency_ms": round(row["lat"] or 0, 1),
+
+            "error_rate": round((row["errn"] or 0) / n, 4) if n else 0,
+
+            "mocked_rate": round((row["mockn"] or 0) / n, 4) if n else 0,
+
+            "active_agents": ag["a"] if ag else 0, "sessions": sess["s"] if sess else 0,
+
+            "cost_usd": round(cost, 4)}
+
+
+
+
+
+@app.get("/api/monitor/daily")
+
+def monitor_daily(days: int = 14):
+
+    items = db.query(
+
+        "SELECT date(ts,'unixepoch','localtime') d, COUNT(*) n, "
+
+        "COALESCE(SUM(ti),0) ti, COALESCE(SUM(to_),0) to_ FROM (" + _obs_sql() + ") "
+
+        "GROUP BY d ORDER BY d DESC LIMIT ?", (days,))
+
+    return {"items": items}
+
+
+
+
+
+@app.get("/api/monitor/models")
+
+def monitor_models():
+
+    items = db.query(
+
+        "SELECT model, COUNT(*) n, COALESCE(SUM(ti),0) ti, COALESCE(SUM(to_),0) to_, "
+
+        "COALESCE(AVG(lat),0) lat FROM (" + _obs_sql() + ") GROUP BY model ORDER BY n DESC")
+
+    for it in items:
+
+        pi, po = _price_of(it["model"])
+
+        it["cost_usd"] = round((it["ti"] * pi + it["to_"] * po) / 1e6, 4)
+
+    return {"items": items}
+
+
+
+
+
+@app.get("/api/monitor/agents")
+
+def monitor_agents():
+
+    items = db.query(
+
+        "SELECT agent_id, COUNT(*) n, COALESCE(SUM(ti),0) ti, COALESCE(SUM(to_),0) to_, "
+
+        "COALESCE(AVG(lat),0) lat, COALESCE(SUM(CASE WHEN err IS NOT NULL AND err<>'' THEN 1 ELSE 0 END),0) errn "
+
+        "FROM (" + _obs_sql() + ") GROUP BY agent_id ORDER BY n DESC LIMIT 20")
+
+    names = {a["id"]: a["name"] for a in db.query("SELECT id,name FROM agents")}
+
+    for it in items:
+
+        it["name"] = names.get(it["agent_id"], it["agent_id"]) if it["agent_id"] else "(未指定)"
+
+    return {"items": items}
+
+
+
+
+
+@app.get("/api/monitor/traces")
+
+def monitor_traces(limit: int = 50, agent_id: str = None):
+
+    sql = "SELECT * FROM (" + _obs_sql() + ")"
+
+    args = []
+
+    if agent_id:
+
+        sql += " WHERE agent_id=?"
+
+        args.append(agent_id)
+
+    sql += " ORDER BY ts DESC LIMIT ?"
+
+    args.append(limit)
+
+    items = db.query(sql, args)
+
+    names = {a["id"]: a["name"] for a in db.query("SELECT id,name FROM agents")}
+
+    titles = {c["id"]: c["title"] for c in db.query("SELECT id,title FROM conversations")}
+
+    for it in items:
+
+        it["agent_name"] = names.get(it["agent_id"], it["agent_id"]) if it["agent_id"] else "(未指定)"
+
+        if it["src"] == "chat":
+
+            it["session_title"] = titles.get(it["session_id"], it["session_id"])
+
+        else:
+
+            it["session_title"] = it["session_id"]
+
+    return {"items": items}
+

@@ -1,0 +1,29 @@
+id: word_proposal
+name: Word 方案智能体
+icon: 📄
+category: 方案编制
+description: 长篇技术方案生成。需求解析 → 大纲拆分 → 术语与数字台账 → 章节并行撰写（自动检索知识库）→ 逐章评审 → 合稿出 docx，支持章节级断点续跑
+runtime: doc
+output: docx
+persona: |
+  你是资深售前解决方案专家，长期负责 IT 运维、可观测、AIOps 类项目的技术标与应标方案编制。
+  输出必须可直接放入正式技术方案：结论先行、段落式表述、数字与口径前后一致，避免空话套话。
+model: ''   # 留空=跟随全局默认模型
+input_schema:
+  - key: project_name
+    label: 项目名称
+    type: text
+    required: true
+    placeholder: 例如：某集团 IT 运维及管理平台建设项目
+  - key: brief
+    label: 项目需求
+    type: textarea
+    required: true
+    placeholder: 粘贴招标需求、建设目标、评分要点等关键信息
+params:
+  chapter_count: 8
+skills:
+  - bid_writing
+tools:
+  - docx_write
+  - kb_search

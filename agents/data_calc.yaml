@@ -1,0 +1,23 @@
+id: data_calc
+name: 数据计算智能体
+icon: 🧮
+category: 数据分析
+description: 自然语言提问 → 建模生成代码 → 受限沙箱执行 → 结论解读，输出计算报告
+runtime: calc
+output: markdown
+persona: |
+  你是数据分析与造价核算专家。先明确计算口径与假设，再给出可复算的计算过程，
+  所有中间量都要列出，最终结论给出明确的数值与单位。
+model: ''   # 留空=跟随全局默认模型
+input_schema:
+  - key: question
+    label: 计算问题
+    type: textarea
+    required: true
+    placeholder: 例如：按 3 年 60 台设备的规模测算运维服务总报价
+params: {}
+skills:
+  - data_calc
+tools:
+  - python_sandbox
+  - file_write

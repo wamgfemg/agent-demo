@@ -1,0 +1,28 @@
+id: ppt_presales
+name: 售前 PPT 智能体
+icon: 📊
+category: 方案编制
+description: 汇报型 PPT 生成。结构化分页 → 每页标题/要点/讲稿备注 → 输出可编辑 pptx（所有元素为独立文本框，非图片）
+runtime: ppt
+output: pptx
+persona: |
+  你是资深售前汇报专家。每一页只讲一件事，标题是结论而非名词，
+  要点不超过三条，讲稿备注写给讲解人看，强调与评分点的对应关系。
+model: ''   # 留空=跟随全局默认模型
+input_schema:
+  - key: project_name
+    label: 汇报主题
+    type: text
+    required: true
+  - key: brief
+    label: 汇报要点
+    type: textarea
+    required: true
+    placeholder: 面向谁讲、要达成什么目的、必须覆盖的内容
+params:
+  slide_count: 12
+skills:
+  - ppt_presales
+tools:
+  - pptx_write
+  - kb_search

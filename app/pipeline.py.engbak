@@ -1,0 +1,508 @@
+# -*- coding: utf-8 -*-
+"""编排引擎：任务状态机 + 执行单元 checkpoint + 并行调度 + 长文档流水线。
+
+设计要点：
+1. 每个执行单元（章节/页面）单独落库，失败只重跑该单元——这是长文档能跑完的前提；
+2. 并行度由信号量控制，适配 2 核小机；
+3. 每个阶段前检查任务状态，支持随时取消；
+4. 模型层可无密钥运行（模拟模式），有密钥后无需改动任何代码。
+"""
+import os, json, re, time, uuid, asyncio, traceback
+from . import db, llm, tools, registry, models, toolregistry, skills as skilllib
+from .config import (ARTIFACT_DIR, MAX_PARALLEL_UNITS, MAX_RETRY_PER_UNIT, UNIT_TIMEOUT_SEC)
+
+RUNNING = {}
+
+RETRIEVE_HINTS = ("search", "retriev", "kb_", "query", "knowledge")
+
+
+def build_system(spec, base):
+    """system prompt = 基础人设 + 技能规范 + 可用工具清单。"""
+    parts = [base]
+    sk = skilllib.render(spec.get("skills") or [])
+    if sk:
+        parts.append("## 作业规范（技能）\n" + sk)
+    tb = toolregistry.prompt_block(spec.get("tools") or [])
+    if tb:
+        parts.append("## 本机可用工具（需要时说明调用意图即可）\n" + tb)
+    return "\n\n".join(parts)
+
+
+def _retrievers(spec):
+    """从智能体工具清单里挑出检索类工具（内置 kb_search 或 MCP 暴露的检索工具）。"""
+    return [t for t in (spec.get("tools") or [])
+            if any(h in t.lower() for h in RETRIEVE_HINTS)]
+
+
+def _query_param(tool_name):
+    """猜检索工具的查询参数名：优先 query/q/question，否则取第一个 string 型属性。"""
+    s = toolregistry.get(tool_name)
+    if not s:
+        return "query"
+    props = (s.get("parameters") or {}).get("properties") or {}
+    for k in ("query", "q", "question", "keyword", "text"):
+        if k in props:
+            return k
+    for k, v in props.items():
+        if isinstance(v, dict) and v.get("type") == "string":
+            return k
+    return "query"
+
+
+async def retrieve(task_id, spec, query, top_k=3, trace=None):
+    """按智能体配置的检索工具取素材；无检索工具则返回空。失败不阻断流水线，只记日志。
+
+    trace 传入列表时，会把每次检索记录进去，便于界面上向构建者展示"用了哪些工具"。
+    """
+    outs = []
+    for t in _retrievers(spec):
+        args = {_query_param(t): query, "top_k": top_k, "limit": top_k}
+        r = await toolregistry.call(t, args, timeout=30)
+        db.log_tool_call(task_id, t, (toolregistry.get(t) or {}).get("source", "?"), args,
+                         bool(r.get("ok")), r.get("_ms", 0))
+        if isinstance(trace, list):
+            hits = len(r.get("hits") or [])
+            trace.append({"round": 0, "tool": t, "args": args, "ok": bool(r.get("ok")),
+                          "ms": r.get("_ms", 0), "hits": hits, "stage": "检索素材"})
+        if r.get("ok"):
+            hits = r.get("hits") or []
+            if hits:
+                outs.append(f"[来源 {t}] " + "\n".join(
+                    f"- {h.get('snippet') or h.get('text') or h.get('content') or ''}" for h in hits[:top_k]))
+            elif r.get("content"):
+                outs.append(f"[来源 {t}] {r['content'][:2000]}")
+    return "\n".join(outs)[:4000]
+
+
+def new_id(prefix="t"):
+    return prefix + uuid.uuid4().hex[:10]
+
+
+def create_task(agent_id, title, input_data, params=None):
+    tid = new_id()
+    db.execute("INSERT INTO tasks(id,agent_id,title,input_json,params_json,status,progress,stage,"
+               "created_at,updated_at) VALUES(?,?,?,?,?,'queued',0,'created',?,?)",
+               (tid, agent_id, title, db.j(input_data or {}), db.j(params or {}), db.now(), db.now()))
+    return tid
+
+
+def _set_stage(task_id, stage, progress=None):
+    kw = {"stage": stage}
+    if progress is not None:
+        kw["progress"] = progress
+    db.update_task(task_id, **kw)
+
+
+def _truthy(v):
+    """模型常把布尔写成字符串："false"/"true"。Python 里非空字符串一律为真，
+    直接 if rev.get("passed") 会让 "false" 判成通过，评审形同虚设。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "pass", "passed", "ok")
+    return bool(v)
+
+
+def _issue_text(issues, limit=3):
+    """评审 issues 可能是字符串数组，也可能是对象数组（含 description/issue 字段）。"""
+    out = []
+    for it in (issues or [])[:limit]:
+        if isinstance(it, dict):
+            t = it.get("description") or it.get("issue") or it.get("msg") or it.get("detail") or ""
+        else:
+            t = str(it)
+        t = str(t).strip()
+        if t:
+            out.append(t[:150])
+    return "；".join(out)
+
+
+def norm_chapters(outline, expect=8):
+    """把大纲解析结果规范化为 [{key,title,target_words,keypoints}]。
+
+    真实模型输出不稳定：chapters 元素可能是对象，也可能退化成字符串数组，
+    甚至整个 outline 不是 dict。这里全部兜住，避免下游 ch.get() 崩溃。
+    """
+    raw = outline.get("chapters") if isinstance(outline, dict) else None
+    if isinstance(raw, str):
+        raw = [raw]
+    chapters = []
+    for i, ch in enumerate(raw or []):
+        if isinstance(ch, dict):
+            title = (ch.get("title") or ch.get("name") or "").strip()
+            kp = ch.get("keypoints") or ch.get("points") or []
+            if isinstance(kp, str):
+                kp = [kp]
+            chapters.append({"key": str(ch.get("key") or f"ch{i+1:02d}"),
+                             "title": title or f"第{i+1}章",
+                             "target_words": ch.get("target_words") or 800,
+                             "keypoints": kp})
+        else:
+            s = re.sub(r"^\s*\d+[.、)．]\s*", "", str(ch or "").strip())
+            if not s:
+                continue
+            chapters.append({"key": f"ch{i+1:02d}", "title": s,
+                             "target_words": 800, "keypoints": []})
+    if not chapters:
+        # 大纲彻底拿不到时按章数补位，保证流水线不会产出空文档
+        chapters = [{"key": f"ch{i+1:02d}", "title": f"第{i+1}章",
+                     "target_words": 800, "keypoints": []} for i in range(max(1, int(expect or 1)))]
+    return chapters
+
+
+def _add_units(task_id, stage, items):
+    """items: [(unit_key, title, input_obj)]  已存在的单元保持原状态（幂等）"""
+    ids = []
+    for i, (key, title, inp) in enumerate(items):
+        row = db.query_one("SELECT id,status FROM task_units WHERE task_id=? AND unit_key=?", (task_id, key))
+        if row:
+            ids.append(row["id"])
+            continue
+        uid = db.execute("INSERT INTO task_units(task_id,unit_key,seq,title,stage,status,input_json,"
+                         "created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?,?)",
+                         (task_id, key, i, title, stage, db.j(inp), db.now(), db.now()))
+        ids.append(uid)
+    return ids
+
+
+def _check_cancel(task_id):
+    r = db.query_one("SELECT status FROM tasks WHERE id=?", (task_id,))
+    if r and r["status"] == "canceled":
+        raise asyncio.CancelledError("任务已取消")
+
+
+async def _json(system, user, hint, ctx, task_id, unit_id=None, role="agent", model=None):
+    fn = lambda: llm.chat_json(system, user, hint=hint, ctx=ctx, task_id=task_id,
+                               unit_id=unit_id, role=role, model=model)
+    return await asyncio.to_thread(fn)
+
+
+async def _text(system, user, hint, ctx, task_id, unit_id=None, role="agent", model=None):
+    fn = lambda: llm.chat(system, user, hint=hint, ctx=ctx, task_id=task_id,
+                          unit_id=unit_id, role=role, model=model)
+    return await asyncio.to_thread(fn)
+
+
+def pick_model(spec, strong=False):
+    """取本步实际使用的模型：智能体显式指定 > 场景模型（强/默认）。
+
+    强模型用于真正吃质量的环节（正文撰写、代码生成），
+    大纲解析、术语表这类结构化步骤走默认模型，省成本也更快。
+    """
+    m = (spec or {}).get("model")
+    if not models.is_placeholder(m):
+        return m
+    return models.resolve(strong=strong)
+
+
+def _save_artifact(task_id, name, path, mime):
+    aid = new_id("a")
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    db.execute("INSERT INTO artifacts(id,task_id,name,path,mime,size,created_at) VALUES(?,?,?,?,?,?,?)",
+               (aid, task_id, name, path, mime, size, db.now()))
+    return aid
+
+
+# ------------------------------------------------------------ 长文档流水线
+DOC_SYS = "你是资深售前解决方案专家，输出必须可直接放入正式技术方案，避免空话，数字与口径保持前后一致。"
+
+
+# 评审规则：必须分级。只有“术语冲突 / 数字与台账矛盾”这类硬伤才算不通过，
+# 否则模型会把“建议补充细节”也判成不通过，导致每章都重跑、成本翻三倍且永远过不了。
+REVIEW_RULE = (
+    "校验以下章节，输出 JSON：passed/score/issues[{severity,description}]。\n"
+    "severity 取值与判定规则：\n"
+    "- blocker：术语与术语表冲突，或关键数字与数字台账矛盾/来源不明 —— 出现即 passed=false\n"
+    "- minor：表述可更充分、建议补充细节等改进建议 —— 不影响 passed\n"
+    "只有存在 blocker 时才判 passed=false；若仅为 minor，passed 应为 true。"
+    "\n\n章节内容：\n"
+)
+
+
+def _review_passed(rev):
+    """先看有没有 blocker，再看模型给的 passed（可能是字符串 false）。"""
+    issues = rev.get("issues") or []
+    for it in issues:
+        if isinstance(it, dict):
+            sev = str(it.get("severity") or it.get("level") or "").strip().lower()
+            if sev in ("blocker", "high", "严重", "阻断", "critical"):
+                return False
+        elif isinstance(it, str) and ("blocker" in it.lower() or "阻断" in it):
+            return False
+    return _truthy(rev.get("passed"))
+
+
+async def run_doc_pipeline(task_id, spec, inp, params):
+    brief = (inp.get("brief") or "").strip()
+    project_name = (inp.get("project_name") or "技术方案").strip()
+    chapter_count = int(params.get("chapter_count") or inp.get("chapter_count") or 8)
+    ctx = {"project_name": project_name, "brief": brief, "chapter_count": chapter_count}
+    # 智能体自定义人设优先于默认人设：同一个流水线，不同智能体可以有不同专业身份
+    SYS = build_system(spec, spec.get("persona") or DOC_SYS)
+
+    # 阶段 1 需求解析
+    _set_stage(task_id, "需求解析", 3)
+    req, _ = await _json(SYS, f"请解析以下项目需求，输出 JSON：project_name/background/score_points/"
+                                  f"deliverables/constraints。\n\n{brief or project_name}",
+                         "requirement", ctx, task_id, role="需求解析", model=pick_model(spec))
+    db.execute("UPDATE tasks SET input_json=? WHERE id=?", (db.j({**inp, "requirement": req}), task_id))
+
+    # 阶段 2 大纲拆分
+    _check_cancel(task_id)
+    _set_stage(task_id, "大纲拆分", 8)
+    outline, _ = await _json(SYS, f"为《{project_name}》编制技术方案大纲，共 {chapter_count} 章，"
+                                      f"输出 JSON：chapters[key,title,target_words,keypoints[]]。",
+                             "outline", ctx, task_id, role="主编", model=pick_model(spec))
+    chapters = norm_chapters(outline, chapter_count)
+
+    # 阶段 3 治理：术语表 + 数字台账（全程唯一权威源）
+    _check_cancel(task_id)
+    _set_stage(task_id, "术语与数字台账", 14)
+    gov, _ = await _json(SYS, f"为《{project_name}》建立术语表与数字台账，输出 JSON："
+                                  f"glossary[term,definition]、numbers[key,value,unit,source]。",
+                         "governance", ctx, task_id, role="治理", model=pick_model(spec))
+    for g in gov.get("glossary") or []:
+        db.execute("INSERT INTO glossary(task_id,term,definition) VALUES(?,?,?)",
+                   (task_id, g.get("term"), g.get("definition")))
+    for n in gov.get("numbers") or []:
+        db.execute("INSERT INTO numbers(task_id,key,value,unit,source) VALUES(?,?,?,?,?)",
+                   (task_id, n.get("key"), n.get("value"), n.get("unit"), n.get("source")))
+
+    # 阶段 4 章节并行生成（含校验与单章重跑）
+    sem = asyncio.Semaphore(MAX_PARALLEL_UNITS)
+
+    async def write_one(ch, idx):
+        async def draft(fix_hint):
+            """写一版：检索素材 → 生成正文 → 评审。返回 (content, rev)。
+
+            评审自身故障不影响正文：正文比评审结果重要，评审失败按通过处理并记录原因。
+            """
+            cctx = {**ctx, "chapter": ch}
+            # 检索类工具（内置 kb_search / MCP 检索工具）按章节取素材，只喂本章相关片段
+            material = await retrieve(task_id, spec, f"{project_name} {ch.get('title')} "
+                                                     f"{' '.join(ch.get('keypoints') or [])}", top_k=3)
+            res = await _text(SYS, f"撰写《{project_name}》第{idx}章：{ch.get('title')}\n"
+                                   f"要点：{ch.get('keypoints')}\n"
+                                   f"术语表：{[g.get('term') for g in (gov.get('glossary') or [])]}\n"
+                                   f"数字台账：{[n.get('key') + '=' + str(n.get('value')) + str(n.get('unit') or '') for n in (gov.get('numbers') or [])]}\n"
+                                   f"{('参考资料（优先采用其中的事实与表述）：' + material) if material else ''}\n"
+                                   f"{fix_hint}\n"
+                                   f"要求：只输出正文 Markdown，不要重复一级标题；"
+                                   f"出现的每个数字都必须能在数字台账中找到出处，术语必须与术语表完全一致。",
+                              "chapter", cctx, task_id, uid, "章节工人",
+                              model=pick_model(spec, strong=True))
+            content = (res.content or "").strip()
+            if len(content) < 30:
+                raise RuntimeError(f"章节正文过短或为空（{len(content)} 字），判定为生成失败")
+            db.execute("UPDATE task_units SET output_json=?,updated_at=? WHERE id=?",
+                       (db.j({"content": content}), db.now(), uid))
+            try:
+                rev, _ = await _json(DOC_SYS, REVIEW_RULE + f"\n\n{content[:3000]}",
+                                     "review", cctx, task_id, uid, "评审", model=pick_model(spec))
+            except Exception as e:
+                rev = {"passed": True, "score": 0, "review_error": f"评审未执行：{str(e)[:160]}"}
+            db.execute("UPDATE task_units SET review_json=?,updated_at=? WHERE id=?",
+                       (db.j(rev), db.now(), uid))
+            return content, rev
+
+        key = ch.get("key") or f"ch{idx:02d}"
+        _add_units(task_id, "write", [(key, ch.get("title", key), ch)])
+        async with sem:
+            row = db.query_one("SELECT id,status,output_json,attempt FROM task_units WHERE task_id=? AND unit_key=?",
+                               (task_id, key))
+            uid, status = row["id"], row["status"]
+            if status == "done" and row["output_json"]:
+                return  # 断点续跑：已完成章节直接复用
+            fix_hint = ""
+            for a in range(MAX_RETRY_PER_UNIT + 1):
+                _check_cancel(task_id)
+                db.execute("UPDATE task_units SET status='running',attempt=?,updated_at=? WHERE id=?",
+                           (a + 1, db.now(), uid))
+                try:
+                    content, rev = await draft(fix_hint)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # 失败必须落库可见，否则任务会“静默成功”——这是最危险的故障形态
+                    db.execute("UPDATE task_units SET status='failed',error=?,updated_at=? WHERE id=?",
+                               (str(e)[:500], db.now(), uid))
+                    print("[pipeline] unit failed", task_id, key, "attempt", a + 1, repr(e)[:200])
+                    continue
+                if _review_passed(rev):
+                    db.execute("UPDATE task_units SET status='done',updated_at=? WHERE id=?", (db.now(), uid))
+                    _progress(task_id)
+                    return
+                issues = _issue_text(rev.get("issues"))
+                if a >= MAX_RETRY_PER_UNIT:
+                    # 评审始终未通过但正文已有：保留内容并标注，交人工确认，绝不丢稿
+                    db.execute("UPDATE task_units SET status='review_failed',error=?,updated_at=? WHERE id=?",
+                               ("评审未通过，需人工确认：" + issues[:400], db.now(), uid))
+                    _progress(task_id)
+                    return
+                # 关键：把上一版的具体问题回喂给重修，而不是换个随机种子再碰一次运气
+                fix_hint = ("\n【上一版未通过评审，必须逐条修正以下问题后再输出】：\n"
+                            + issues + "\n")
+            _progress(task_id)
+
+    def _progress(tid):
+        rows = db.query("SELECT status FROM task_units WHERE task_id=?", (tid,))
+        if not rows:
+            return
+        done = sum(1 for r in rows if r["status"] == "done")
+        db.update_task(tid, progress=14 + int(done * 76 / max(1, len(rows))))
+
+    _set_stage(task_id, "章节并行生成", 15)
+    tasks = [write_one(ch, i + 1) for i, ch in enumerate(chapters)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+            print("[pipeline] unit error", r)
+
+    # 阶段 5 合稿
+    _check_cancel(task_id)
+    _set_stage(task_id, "合稿与排版", 95)
+    rows = db.query("SELECT unit_key,title,seq,status,output_json FROM task_units WHERE task_id=? ORDER BY seq", (task_id,))
+    compiled = []
+    for r in rows:
+        out = db.uj(r["output_json"]) or {}
+        c = (out.get("content") or "").strip()
+        if c:
+            compiled.append({"title": r["title"], "content": c})
+    # 一道都不能少：没有任何正文却标记为成功，是最危险的故障形态（用户会拿到空壳文档）
+    if chapters and not compiled:
+        failed = db.query("SELECT unit_key,error FROM task_units WHERE task_id=? AND status='failed'", (task_id,))
+        first_err = (failed[0]["error"] if failed and failed[0]["error"] else "未知原因")
+        raise RuntimeError(f"全部 {len(chapters)} 个章节生成失败，未产出正文。首个错误：{first_err[:200]}")
+    # 部分失败时记进阶段名，避免用户以为全部成功
+    if chapters and len(compiled) < len(chapters):
+        _set_stage(task_id, f"合稿（{len(compiled)}/{len(chapters)} 章成功）", 95)
+    fname = f"{project_name}-技术方案-{time.strftime('%Y%m%d-%H%M%S')}.docx"
+    path = os.path.join(ARTIFACT_DIR, fname)
+    await asyncio.to_thread(tools.write_docx, project_name, compiled, path,
+                            gov.get("glossary"), gov.get("numbers"), "自动生成 · AgentForge")
+    _save_artifact(task_id, fname, path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    _set_stage(task_id, "已完成", 100)
+    db.update_task(task_id, status="done", stage="已完成", progress=100)
+    return {"artifact": fname, "chapters": len(compiled)}
+
+
+# ------------------------------------------------------------ PPT 流水线
+async def run_ppt_pipeline(task_id, spec, inp, params):
+    project_name = (inp.get("project_name") or "方案汇报").strip()
+    brief = (inp.get("brief") or "").strip()
+    n = int(params.get("slide_count") or inp.get("slide_count") or 10)
+    ctx = {"project_name": project_name, "brief": brief, "slide_count": n}
+    _set_stage(task_id, "页面大纲", 20)
+    material = await retrieve(task_id, spec, f"{project_name} {brief}", top_k=3)
+    data, _ = await _json(build_system(spec, spec.get("persona") or "你是售前汇报专家，输出结构化分页内容。"),
+                          f"为《{project_name}》生成 {n} 页汇报 PPT 内容，输出 JSON："
+                          f"slides[index,title,bullets[],notes]。\n\n{brief}"
+                          f"{chr(10) + '参考资料：' + material if material else ''}",
+                          "ppt_outline", ctx, task_id, role="PPT主编", model=pick_model(spec, strong=True))
+    slides = data.get("slides") or []
+    _set_stage(task_id, "生成可编辑 PPT", 70)
+    fname = f"{project_name}-汇报PPT-{time.strftime('%Y%m%d-%H%M%S')}.pptx"
+    path = os.path.join(ARTIFACT_DIR, fname)
+    await asyncio.to_thread(tools.write_pptx, project_name, slides, path)
+    _save_artifact(task_id, fname, path, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    _set_stage(task_id, "已完成", 100)
+    db.update_task(task_id, status="done", stage="已完成", progress=100)
+    return {"artifact": fname, "slides": len(slides)}
+
+
+# ------------------------------------------------------------ 数据计算
+async def run_calc(task_id, spec, inp, params):
+    question = (inp.get("question") or "").strip()
+    _set_stage(task_id, "构建计算模型", 30)
+    data, _ = await _json(build_system(spec, spec.get("persona") or "你是数据分析专家，用 Python 求解。"),
+                          f"针对问题生成仅用标准库的计算代码，输出 JSON：language/code/explanation。\n\n{question}",
+                          "calc", {"question": question}, task_id, role="建模", model=pick_model(spec, strong=True))
+    code = data.get("code") or "result = None"
+    _set_stage(task_id, "沙箱执行", 70)
+    out = await toolregistry.call("python_sandbox", {"code": code}, timeout=20)
+    db.log_tool_call(task_id, "python_sandbox", "builtin", {"code": code[:200]},
+                     bool(out.get("ok")), out.get("_ms", 0))
+    summary = (await _text(build_system(spec, spec.get("persona") or "你是数据分析专家。"),
+                           f"问题：{question}\n代码：{code}\n执行输出：{out}\n请用中文简要说明结论。",
+                           "report", {}, task_id, role="解读", model=pick_model(spec))).content
+    fname = f"计算报告-{time.strftime('%Y%m%d-%H%M%S')}.md"
+    path = os.path.join(ARTIFACT_DIR, fname)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# 计算报告\n\n**问题**：{question}\n\n## 代码\n```python\n{code}\n```\n\n"
+                f"## 执行结果\n```\n{out}\n```\n\n## 结论\n{summary}\n")
+    _save_artifact(task_id, fname, path, "text/markdown")
+    db.update_task(task_id, status="done", stage="已完成", progress=100)
+    return {"artifact": fname, "result": out}
+
+
+# ------------------------------------------------------------ 项目跟踪报告
+async def run_report(task_id, spec, inp, params):
+    data_ = inp.get("data") or inp.get("brief") or ""
+    _set_stage(task_id, "汇总分析", 50)
+    text = (await _text(build_system(spec, spec.get("persona") or "你是项目管理专家，输出周报/风险清单。"),
+                        f"基于以下项目信息生成跟踪报告：进度、风险、待办、下周计划。\n\n{data_}",
+                        "report", {}, task_id, role="项目跟踪", model=pick_model(spec))).content
+    fname = f"项目跟踪报告-{time.strftime('%Y%m%d-%H%M%S')}.md"
+    path = os.path.join(ARTIFACT_DIR, fname)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# 项目跟踪报告\n\n生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n{text}\n")
+    _save_artifact(task_id, fname, path, "text/markdown")
+    db.update_task(task_id, status="done", stage="已完成", progress=100)
+    return {"artifact": fname}
+
+
+MODES = {"doc": run_doc_pipeline, "ppt": run_ppt_pipeline,
+         "calc": run_calc, "report": run_report}
+
+
+async def execute_task(task_id):
+    from . import runtime
+    row = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not row:
+        return
+    spec = registry.get_published_or_draft(row["agent_id"]) or {}
+    db.update_task(task_id, status="running", stage="启动", updated_at=db.now())
+    try:
+        result = await runtime.run_task(task_id, spec, db.uj(row["input_json"]) or {},
+                                        db.uj(row["params_json"]) or {})
+        db.update_task(task_id, status="done", progress=100, stage="已完成",
+                       error=None, updated_at=db.now())
+        return result
+    except asyncio.CancelledError:
+        db.update_task(task_id, status="canceled", stage="已取消", updated_at=db.now())
+    except Exception as e:
+        traceback.print_exc()
+        db.update_task(task_id, status="failed", stage="失败", error=str(e)[:500], updated_at=db.now())
+    finally:
+        RUNNING.pop(task_id, None)
+
+
+def start_task(task_id):
+    """必须在事件循环上下文中调用；重复调用安全。"""
+    if task_id in RUNNING:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    RUNNING[task_id] = loop.create_task(execute_task(task_id))
+    return True
+
+
+async def scheduler(interval=2):
+    """后台调度：捡起 queued 状态的任务，避免依赖单次路由调用是否成功。"""
+    while True:
+        try:
+            for r in db.query("SELECT id FROM tasks WHERE status='queued' ORDER BY created_at LIMIT 3"):
+                if r["id"] not in RUNNING:
+                    start_task(r["id"])
+        except Exception as e:
+            print("[scheduler]", e)
+        await asyncio.sleep(interval)
+
+
+def resume_interrupted():
+    """服务重启后，把 running/queued 的任务标记为 interrupted，等待人工续跑（已完成单元会复用）。"""
+    db.execute("UPDATE tasks SET status='interrupted',stage='已中断' WHERE status IN ('running','queued')")
