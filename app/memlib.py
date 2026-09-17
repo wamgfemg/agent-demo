@@ -71,6 +71,9 @@ def summarize_update(operator_id, agent_id, user_msg, assistant_msg, llm_chat):
     try:
         r = llm_chat(system, user)
         new = (r.content or "").strip()
+        # 模型原样回显"（无）"等占位 → 不写库
+        if new in ("（无）", "无", "（暂无）", "(none)", "none", "无记忆"):
+            return old
         if new and len(new) < MAX_MEMORY_CHARS * 2:
             set_memory(operator_id, agent_id, new)
             return new
