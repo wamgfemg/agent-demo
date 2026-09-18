@@ -4739,6 +4739,10 @@ header .logo,header .tab,header .view-switch button,header .badge,header button{
 .chk{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--line);border-radius:8px;padding:8px 10px;cursor:pointer}
 .chk.on{border-color:var(--green);background:rgba(34,197,94,.06)}
 
+
+/* ---- 应用评测/运营 ---- */
+.op-on{border-color:var(--blue);box-shadow:0 0 0 3px rgba(56,189,248,.15)}
+
 </style>
 
 
@@ -5420,6 +5424,8 @@ const TABS = [
   {id:'widget', name:'Widget',      roles:['builder']},
   {id:'kb',    name:'知识库',       roles:['builder']},
   {id:'wf',    name:'工作流',       roles:['builder']},
+  {id:'eval',  name:'应用评测',     roles:['builder']},
+  {id:'ops',   name:'应用运营',     roles:['builder']},
 
 
 
@@ -7064,6 +7070,8 @@ async function render(){
     if(S.tab === 'widget') await viewWidget(v, seq);
     if(S.tab === 'kb')    await viewKB(v, seq);
     if(S.tab === 'wf')    await viewWF(v, seq);
+    if(S.tab === 'eval')  await viewEval(v, seq);
+    if(S.tab === 'ops')   await viewOps(v, seq);
 
 
 
@@ -33822,6 +33830,258 @@ function kbBindHTML(E){
   return '<div class="field"><label>知识库绑定 - 对话时自动检索注入（RAG）</label>' +
     '<div class="small" style="margin:-2px 0 8px">勾选后该智能体每轮对话自动检索所选知识库的 top5 片段作为参考资料</div>' +
     '<div class="grid g2">' + items + '</div></div>';
+}
+
+
+/* ------------------------------------------------------------ 应用评测 */
+const EV = {agentId:'', cases:[], runs:[], running:false, curRun:null};
+
+async function viewEval(v, seq){
+  if(!EV.agentId){
+    try{ const d = await api('/api/agents'); const first = (d.items||[])[0]; if(first) EV.agentId = first.id; }catch(e){}
+  }
+  await evLoad();
+  setView(v, seq, renderEval());
+}
+async function evLoad(){
+  if(!EV.agentId){ EV.cases = []; EV.runs = []; return; }
+  try{ EV.cases = (await api('/api/eval/cases?agent_id=' + encodeURIComponent(EV.agentId))).items || []; }catch(e){ EV.cases = []; }
+  try{ EV.runs = (await api('/api/eval/runs?agent_id=' + encodeURIComponent(EV.agentId))).items || []; }catch(e){ EV.runs = []; }
+}
+function evRepaint(){ const v = $('view'); if(v && S.tab === 'eval') v.innerHTML = renderEval(); }
+function evToast(t){ wtToast(t); }
+async function evPickAgent(){
+  try{
+    const d = await api('/api/agents');
+    const items = d.items || [];
+    if(!items.length){ evToast('请先在「智能体构建」创建智能体'); return; }
+    let h = '<div class="row"><b>选择要评测的智能体</b></div><div style="margin-top:10px;max-height:300px;overflow:auto">';
+    items.forEach(a => {
+      h += '<div class="chk' + (EV.agentId === a.id ? ' on' : '') + '" onclick="EV.agentId=\'' + esc(a.id) + '\';closeModal();evGo()">' +
+        '<div><b>' + esc(a.icon || '') + ' ' + esc(a.name) + '</b><div class="small">' + esc(a.id) + '</div></div></div>';
+    });
+    openModal(h + '</div>');
+  }catch(e){ evToast(e.message); }
+}
+function evGo(){ viewEval($('view'), renderSeq); }
+
+function evScoreBadge(s){
+  if(s < 0) return '<span class="chip">未评分</span>';
+  const color = s >= 8 ? 'var(--green)' : (s >= 6 ? 'var(--amber)' : 'var(--red)');
+  return '<span class="chip" style="color:' + color + ';border-color:' + color + '">' + s + '分</span>';
+}
+
+function renderEval(){
+  let h = '<div class="card"><div class="row" style="align-items:center;flex-wrap:wrap">' +
+    '<b style="font-size:15px">应用评测</b>' +
+    '<span class="small" style="margin-left:10px">评测集批量试答 + LLM 裁判对比参考答案打分（0-10）</span>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    '<button class="ghost sm" onclick="evPickAgent()">' + (EV.agentId ? '切换智能体' : '选择智能体') + '</button>' +
+    '<button class="ghost sm" style="margin-left:8px" onclick="evAddCase()">+ 新增用例</button>' +
+    (EV.agentId ? '<button class="sm" style="margin-left:8px"' + (EV.running ? ' disabled' : '') + ' onclick="evRun()">' + (EV.running ? '评测中…' : '▶ 开始评测') + '</button>' : '') +
+    '</div>' +
+    (EV.agentId ? '<div class="small" style="color:var(--dim);margin-top:6px">当前智能体：' + esc(EV.agentId) + ' · 用例 ' + EV.cases.length + ' 条</div>' : '') +
+    '</div>';
+
+  if(!EV.agentId){
+    return h + '<div class="empty">先选择一个智能体<br></div>';
+  }
+  if(EV.running){
+    h += '<div class="card"><div class="small" style="color:var(--amber)">⏳ 正在逐条运行用例并评分（每条约 10-30 秒），可稍后刷新查看结果…</div></div>';
+  }
+
+  /* 用例表 */
+  if(!EV.cases.length){
+    h += '<div class="empty">还没有评测用例。点「+ 新增用例」添加：输入 + 参考答案/评分要点<br></div>';
+  }else{
+    h += '<div class="card"><b style="font-size:13.5px">评测集</b><table style="margin-top:8px"><tr><th style="width:160px">用例名</th><th>输入</th><th style="width:220px">参考答案/评分要点</th><th style="width:130px">操作</th></tr>';
+    EV.cases.forEach(c => {
+      h += '<tr><td>' + esc(c.name) + '</td>' +
+        '<td class="small" style="color:var(--dim)">' + esc((c.input||'').slice(0,80)) + '</td>' +
+        '<td class="small" style="color:var(--dim)">' + esc((c.expected||'').slice(0,60) || '（无·不评分）') + '</td>' +
+        '<td><a class="ptpl-act" onclick="evEditCase(' + c.id + ')">编辑</a><a class="ptpl-act" style="color:var(--red)" onclick="evDelCase(' + c.id + ')">删除</a></td></tr>';
+    });
+    h += '</table></div>';
+  }
+
+  /* 历史记录 */
+  if(EV.runs.length){
+    h += '<div class="card"><b style="font-size:13.5px">评测历史</b><table style="margin-top:8px"><tr><th style="width:70px">#</th><th style="width:90px">平均分</th><th style="width:70px">用例数</th><th style="width:150px">模型</th><th style="width:90px">时间</th><th style="width:170px">操作</th></tr>';
+    EV.runs.forEach(r => {
+      h += '<tr><td>' + r.id + '</td>' +
+        '<td>' + (r.avg_score >= 0 ? '<b style="color:' + (r.avg_score >= 8 ? 'var(--green)' : r.avg_score >= 6 ? 'var(--amber)' : 'var(--red)') + '">' + r.avg_score + '</b>' : '-') + '</td>' +
+        '<td>' + r.case_count + '</td><td class="small" style="color:var(--dim)">' + esc(r.model || '') + '</td>' +
+        '<td class="small" style="color:var(--dim)">' + fmtTime(r.created_at) + '</td>' +
+        '<td><a class="ptpl-act" onclick="evViewRun(' + r.id + ')">查看明细</a><a class="ptpl-act" style="color:var(--red)" onclick="evDelRun(' + r.id + ')">删除</a></td></tr>';
+    });
+    h += '</table></div>';
+  }
+
+  /* 最近一次结果明细 */
+  if(EV.curRun){
+    const r = EV.curRun;
+    h += '<div class="card"><div class="row"><b>评测明细 · run #' + r.id + '</b>' +
+      '<span class="spacer" style="flex:1"></span><span class="chip chip-on">平均 ' + (r.avg_score >= 0 ? r.avg_score : '未评分') + '</span></div>';
+    (r.results || []).forEach(x => {
+      h += '<div style="border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin-top:10px">' +
+        '<div class="row" style="align-items:center;flex-wrap:wrap"><b style="font-size:13px">' + esc(x.name) + '</b>' +
+        evScoreBadge(x.score) + '<span class="small" style="color:var(--dim)">' + x.ms + 'ms · in ' + x.tokens_in + ' / out ' + x.tokens_out + '</span></div>' +
+        '<div class="small" style="margin-top:6px"><span style="color:var(--dim)">输入：</span>' + esc(x.input) + '</div>' +
+        '<div class="small" style="margin-top:4px"><span style="color:var(--dim)">回答：</span>' + esc((x.reply||'').slice(0,260)) + '</div>' +
+        (x.reason ? '<div class="small" style="margin-top:4px;color:var(--amber)">点评：' + esc(x.reason) + '</div>' : '') +
+        '</div>';
+    });
+    h += '</div>';
+  }
+  return h;
+}
+
+function evCaseModal(c){
+  const isNew = !c;
+  openModal('<div class="row"><b>' + (isNew ? '新增评测用例' : '编辑评测用例') + '</b></div>' +
+    '<div id="evMsg" style="margin:8px 0"></div>' +
+    '<input id="evName" placeholder="用例名（可选）" style="width:100%" value="' + esc(c ? c.name : '') + '">' +
+    '<textarea id="evInput" class="ptpl-ta" style="min-height:80px;margin-top:10px" placeholder="输入（发给智能体的问题/指令）">' + esc(c ? c.input : '') + '</textarea>' +
+    '<textarea id="evExpected" class="ptpl-ta" style="min-height:80px;margin-top:10px" placeholder="参考答案/评分要点（裁判按此打分；留空则不评分）">' + esc(c ? c.expected : '') + '</textarea>' +
+    '<div class="row" style="margin-top:12px;justify-content:flex-end">' +
+    '<button class="ghost" onclick="closeModal()">取消</button>' +
+    '<button class="sm" style="margin-left:8px" onclick="evSaveCase(' + (c ? c.id : 0) + ')">保存</button></div>');
+}
+function evAddCase(){ evCaseModal(null); }
+function evEditCase(cid){
+  const c = EV.cases.filter(x => x.id === cid)[0];
+  if(c) evCaseModal(c);
+}
+async function evSaveCase(cid){
+  const body = {agent_id: EV.agentId, name: $('evName').value.trim(),
+                input: $('evInput').value, expected: $('evExpected').value};
+  if(!body.input.trim()){ msg('evMsg', 'err', '输入不能为空'); return; }
+  try{
+    if(cid){ await api('/api/eval/cases/' + cid, {method:'PUT', body:JSON.stringify(body)}); }
+    else{ await api('/api/eval/cases', {method:'POST', body:JSON.stringify(body)}); }
+    closeModal(); evToast('已保存'); evGo();
+  }catch(e){ msg('evMsg', 'err', e.message); }
+}
+async function evDelCase(cid){
+  if(!confirm('删除该用例？')) return;
+  try{ await api('/api/eval/cases/' + cid, {method:'DELETE'}); evGo(); }catch(e){ evToast(e.message); }
+}
+async function evRun(){
+  if(!EV.cases.length){ evToast('请先添加用例'); return; }
+  EV.running = true; evRepaint();
+  try{
+    const r = await api('/api/eval/run', {method:'POST', body:JSON.stringify({agent_id:EV.agentId})});
+    EV.curRun = r; evToast('评测完成，平均分 ' + (r.avg_score >= 0 ? r.avg_score : '未评分'));
+  }catch(e){ evToast('评测失败：' + e.message); }
+  EV.running = false; evGo();
+}
+async function evViewRun(rid){
+  try{
+    EV.curRun = await api('/api/eval/runs/' + rid);
+    evRepaint();
+    const v = $('view'); if(v) v.scrollTop = v.scrollHeight;
+  }catch(e){ evToast(e.message); }
+}
+async function evDelRun(rid){
+  if(!confirm('删除该评测记录？')) return;
+  try{ await api('/api/eval/runs/' + rid, {method:'DELETE'}); if(EV.curRun && EV.curRun.id === rid) EV.curRun = null; evGo(); }
+  catch(e){ evToast(e.message); }
+}
+
+/* ------------------------------------------------------------ 应用运营 */
+const OP = {overview:[], agentId:'', convs:[], feedback:[]};
+
+async function viewOps(v, seq){
+  await opLoad();
+  setView(v, seq, renderOps());
+}
+async function opLoad(){
+  try{ OP.overview = (await api('/api/ops/overview')).items || []; }catch(e){ OP.overview = []; }
+  if(OP.agentId){
+    try{ OP.convs = (await api('/api/ops/conversations?agent_id=' + encodeURIComponent(OP.agentId))).items || []; }catch(e){ OP.convs = []; }
+  }else{ OP.convs = []; }
+  try{ OP.feedback = (await api('/api/ops/feedback')).items || []; }catch(e){ OP.feedback = []; }
+}
+function opRepaint(){ const v = $('view'); if(v && S.tab === 'ops') v.innerHTML = renderOps(); }
+function opGo(){ viewOps($('view'), renderSeq); }
+
+function renderOps(){
+  let h = '<div class="card"><div class="row" style="align-items:center;flex-wrap:wrap">' +
+    '<b style="font-size:15px">应用运营</b>' +
+    '<span class="small" style="margin-left:10px">按应用看运营数据：对话量 · 用户反馈 · 满意度 · 错误</span>' +
+    '<span class="spacer" style="flex:1"></span>' +
+    '<button class="ghost sm" onclick="opGo()">⟳ 刷新</button>' +
+    '</div></div>';
+
+  if(!OP.overview.length){
+    return h + '<div class="empty">暂无智能体<br></div>';
+  }
+  h += '<div class="wt-grid">';
+  OP.overview.forEach(a => {
+    const fb = a.up + a.down;
+    const sat = fb > 0 ? Math.round(a.up * 100 / fb) : -1;
+    h += '<div class="wt-card' + (OP.agentId === a.id ? ' op-on' : '') + '" onclick="opPick(\'' + esc(a.id) + '\')" style="cursor:pointer">' +
+      '<div class="row" style="align-items:center"><b style="font-size:13.5px">' + esc(a.icon || '') + ' ' + esc(a.name) + '</b>' +
+      '<span class="spacer" style="flex:1"></span>' +
+      (a.enabled === 0 ? '<span class="chip" style="color:var(--dim)">已停用</span>' : '') + '</div>' +
+      '<div class="row" style="gap:14px;margin-top:10px;flex-wrap:wrap" class="small">' +
+      '<span class="small">💬 ' + (a.conv_count||0) + ' 会话</span>' +
+      '<span class="small">✉️ ' + (a.msg_count||0) + ' 提问</span>' +
+      '<span class="small">🔤 ' + (a.tokens||0) + ' tokens</span>' +
+      (a.err_count ? '<span class="small" style="color:var(--red)">⚠ ' + a.err_count + ' 错误</span>' : '') + '</div>' +
+      '<div class="row" style="gap:14px;margin-top:6px;flex-wrap:wrap">' +
+      '<span class="small">👍 ' + (a.up||0) + '</span><span class="small">👎 ' + (a.down||0) + '</span>' +
+      '<span class="small">✅ ' + (a.adopt||0) + ' 采纳</span>' +
+      (sat >= 0 ? '<span class="small" style="color:' + (sat >= 70 ? 'var(--green)' : 'var(--amber)') + '">满意度 ' + sat + '%</span>' : '<span class="small" style="color:var(--dim)">暂无反馈</span>') +
+      '</div>' +
+      '<div class="small" style="color:var(--dim);margin-top:6px">最近活跃：' + (a.last_active ? fmtTime(a.last_active) : '从未使用') + '</div>' +
+      '</div>';
+  });
+  h += '</div>';
+
+  /* 会话明细 */
+  if(OP.agentId){
+    h += '<div class="card"><div class="row"><b style="font-size:13.5px">「' + esc(OP.agentId) + '」最近会话</b>' +
+      '<span class="spacer" style="flex:1"></span>' +
+      '<a class="ptpl-act" onclick="OP.agentId=\'\';opGo()">收起</a></div>';
+    if(!OP.convs.length){
+      h += '<div class="small" style="color:var(--dim);margin-top:8px">暂无会话记录</div>';
+    }else{
+      h += '<table style="margin-top:8px"><tr><th>会话</th><th style="width:80px">消息数</th><th style="width:100px">最近活跃</th><th style="width:90px">操作</th></tr>';
+      OP.convs.forEach(c => {
+        h += '<tr><td>' + esc(c.title || c.id) + '</td><td>' + (c.msg_count||0) + '</td>' +
+          '<td class="small" style="color:var(--dim)">' + fmtTime(c.updated_at) + '</td>' +
+          '<td><a class="ptpl-act" onclick="opViewConv(\'' + esc(c.id) + '\')">查看</a></td></tr>';
+      });
+      h += '</table>';
+    }
+    h += '</div>';
+  }
+
+  /* 反馈流 */
+  if(OP.feedback.length){
+    h += '<div class="card"><b style="font-size:13.5px">用户反馈流（赞同/反对/采纳）</b><table style="margin-top:8px"><tr><th style="width:140px">应用</th><th>内容摘要</th><th style="width:100px">操作人</th><th style="width:130px">反馈</th></tr>';
+    OP.feedback.forEach(p => {
+      h += '<tr><td class="small">' + esc(p.agent_name || p.agent_id || '') + '</td>' +
+        '<td class="small" style="color:var(--dim)">' + esc((p.summary || p.content || '').slice(0,70)) + '</td>' +
+        '<td class="small" style="color:var(--dim)">' + esc(p.operator_name || '') + '</td>' +
+        '<td class="small">👍' + (p.up_count||0) + ' 👎' + (p.down_count||0) + ' ✅' + (p.adopt_count||0) + '</td></tr>';
+    });
+    h += '</table></div>';
+  }
+  return h;
+}
+function opPick(id){ OP.agentId = (OP.agentId === id ? '' : id); opGo(); }
+async function opViewConv(cid){
+  try{
+    const d = await api('/api/conversations/' + cid);
+    let h = '<div class="row"><b>' + esc(d.title || cid) + '</b><span class="spacer" style="flex:1"></span>' +
+      '<span class="small">' + (d.messages||[]).length + ' 条消息</span></div><div style="margin-top:10px;max-height:56vh;overflow:auto">';
+    (d.messages || []).forEach(m => {
+      h += '<div class="chat-msg ' + (m.role === 'user' ? 'user' : 'assistant') + '" style="margin:6px 0">' + esc((m.content||'').slice(0,500)) + '</div>';
+    });
+    openModal(h + '</div><div class="row" style="margin-top:12px"><button class="ghost" onclick="closeModal()">关闭</button></div>');
+  }catch(e){ wtToast(e.message); }
 }
 
 </script>

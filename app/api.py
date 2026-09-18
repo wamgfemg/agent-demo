@@ -38,7 +38,7 @@ from . import (db, registry, pipeline, llm, toolregistry, mcp, runtime, models, 
 
 
 
-               skills as skilllib, ptpl, widgetlib, kblib, memlib, wflib)
+               skills as skilllib, ptpl, widgetlib, kblib, memlib, wflib, evallib)
 
 
 
@@ -118,6 +118,7 @@ async def _startup():
     kblib.ensure_tables()
     memlib.ensure_tables()
     wflib.ensure_tables()
+    evallib.ensure_tables()
 
 
 
@@ -3441,3 +3442,129 @@ async def wf_run(wid: int, body: WFRunIn):
 @app.get("/api/wf/{wid}/runs")
 def wf_runs(wid: int):
     return {"items": wflib.list_runs(wid)}
+
+
+# ================================================================== 应用评测
+class EvalCaseIn(BaseModel):
+    agent_id: str
+    name: str = ""
+    input: str
+    expected: str = ""
+
+
+@app.get("/api/eval/cases")
+def eval_cases(agent_id: str):
+    return {"items": evallib.list_cases(agent_id)}
+
+
+@app.post("/api/eval/cases")
+def eval_case_add(body: EvalCaseIn):
+    try:
+        cid = evallib.add_case(body.agent_id, body.name, body.input, body.expected)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "id": cid}
+
+
+@app.put("/api/eval/cases/{cid}")
+def eval_case_update(cid: int, body: EvalCaseIn):
+    try:
+        evallib.update_case(cid, body.name, body.input, body.expected)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/eval/cases/{cid}")
+def eval_case_delete(cid: int):
+    evallib.delete_case(cid)
+    return {"ok": True}
+
+
+class EvalRunIn(BaseModel):
+    agent_id: str
+
+
+@app.post("/api/eval/run")
+async def eval_run(body: EvalRunIn):
+    try:
+        spec = registry.get_published_or_draft(body.agent_id)
+    except Exception:
+        spec = None
+
+    def _llm(system, user):
+        return llm.chat(system, user, hint="eval")
+
+    def _kb(ids, q, k):
+        return kblib.format_context(kblib.search(ids, q, k))
+
+    try:
+        r = await asyncio.to_thread(evallib.run_eval, body.agent_id, _llm, _kb, spec)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+    return r
+
+
+@app.get("/api/eval/runs")
+def eval_runs(agent_id: str):
+    return {"items": evallib.list_runs(agent_id)}
+
+
+@app.get("/api/eval/runs/{rid}")
+def eval_run_detail(rid: int):
+    r = evallib.get_run(rid)
+    if not r:
+        raise HTTPException(404, "评测记录不存在")
+    return r
+
+
+@app.delete("/api/eval/runs/{rid}")
+def eval_run_delete(rid: int):
+    evallib.delete_run(rid)
+    return {"ok": True}
+
+
+# ================================================================== 应用运营
+@app.get("/api/ops/overview")
+def ops_overview():
+    """按智能体聚合：对话量、消息量、token、反馈（赞同/反对/采纳）、错误数、最近活跃。"""
+    rows = query("""
+        SELECT a.id, a.name, a.icon, a.enabled,
+          (SELECT COUNT(*) FROM conversations c WHERE c.agent_id=a.id) AS conv_count,
+          (SELECT COUNT(*) FROM chat_messages m JOIN conversations c2 ON m.conversation_id=c2.id
+             WHERE c2.agent_id=a.id AND m.role='user') AS msg_count,
+          (SELECT COALESCE(SUM(m.tokens_in+m.tokens_out),0) FROM chat_messages m
+             JOIN conversations c3 ON m.conversation_id=c3.id WHERE c3.agent_id=a.id) AS tokens,
+          (SELECT COUNT(*) FROM chat_messages m JOIN conversations c4 ON m.conversation_id=c4.id
+             WHERE c4.agent_id=a.id AND m.error IS NOT NULL AND m.error != '') AS err_count,
+          (SELECT COALESCE(SUM(p.up_count),0) FROM prompt_logs p WHERE p.agent_id=a.id) AS up,
+          (SELECT COALESCE(SUM(p.down_count),0) FROM prompt_logs p WHERE p.agent_id=a.id) AS down,
+          (SELECT COALESCE(SUM(p.adopt_count),0) FROM prompt_logs p WHERE p.agent_id=a.id) AS adopt,
+          (SELECT COALESCE(MAX(c5.updated_at),0) FROM conversations c5 WHERE c5.agent_id=a.id) AS last_active
+        FROM agents a ORDER BY last_active DESC, a.id
+    """)
+    return {"items": rows}
+
+
+@app.get("/api/ops/conversations")
+def ops_conversations(agent_id: str, limit: int = 30):
+    convs = query("SELECT id,title,created_at,updated_at,"
+                  "(SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id=conversations.id) AS msg_count "
+                  "FROM conversations WHERE agent_id=? ORDER BY updated_at DESC LIMIT ?",
+                  (agent_id, max(1, min(100, limit))))
+    return {"items": convs}
+
+
+@app.get("/api/ops/feedback")
+def ops_feedback(agent_id: str = None, limit: int = 50):
+    where, args = ["source='chat' AND (up_count>0 OR down_count>0 OR adopt_count>0)"], []
+    if agent_id:
+        where.append("agent_id=?")
+        args.append(agent_id)
+    rows = query("SELECT id,agent_id,agent_name,operator_name,summary,content,"
+                 "up_count,down_count,adopt_count,status,created_at FROM prompt_logs "
+                 "WHERE " + " AND ".join(where) + " ORDER BY updated_at DESC LIMIT ?",
+                 args + [max(1, min(200, limit))])
+    return {"items": rows}
