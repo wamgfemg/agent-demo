@@ -3530,7 +3530,7 @@ def eval_run_delete(rid: int):
 @app.get("/api/ops/overview")
 def ops_overview():
     """按智能体聚合：对话量、消息量、token、反馈（赞同/反对/采纳）、错误数、最近活跃。"""
-    rows = query("""
+    rows = db.query("""
         SELECT a.id, a.name, a.icon, a.enabled,
           (SELECT COUNT(*) FROM conversations c WHERE c.agent_id=a.id) AS conv_count,
           (SELECT COUNT(*) FROM chat_messages m JOIN conversations c2 ON m.conversation_id=c2.id
@@ -3550,7 +3550,7 @@ def ops_overview():
 
 @app.get("/api/ops/conversations")
 def ops_conversations(agent_id: str, limit: int = 30):
-    convs = query("SELECT id,title,created_at,updated_at,"
+    convs = db.query("SELECT id,title,created_at,updated_at,"
                   "(SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id=conversations.id) AS msg_count "
                   "FROM conversations WHERE agent_id=? ORDER BY updated_at DESC LIMIT ?",
                   (agent_id, max(1, min(100, limit))))
@@ -3563,7 +3563,7 @@ def ops_feedback(agent_id: str = None, limit: int = 50):
     if agent_id:
         where.append("agent_id=?")
         args.append(agent_id)
-    rows = query("SELECT id,agent_id,agent_name,operator_name,summary,content,"
+    rows = db.query("SELECT id,agent_id,agent_name,operator_name,summary,content,"
                  "up_count,down_count,adopt_count,status,created_at FROM prompt_logs "
                  "WHERE " + " AND ".join(where) + " ORDER BY updated_at DESC LIMIT ?",
                  args + [max(1, min(200, limit))])
